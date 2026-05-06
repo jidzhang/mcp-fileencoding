@@ -10,7 +10,7 @@ def decode_to_utf8(data: bytes, encoding: str) -> tuple[str, list[str]]:
     将字节数据从指定编码转换为 UTF-8 字符串
     返回 (内容, 警告列表)
     """
-    warnings = []
+    warnings: list[str] = []
 
     # 处理带 BOM 的 UTF-8
     if encoding.lower() in ('utf-8-sig', 'utf-8'):
@@ -34,7 +34,7 @@ def encode_from_utf8(content: str, encoding: str) -> tuple[bytes, list[str]]:
     将 UTF-8 字符串转换为指定编码的字节数据
     返回 (字节数据, 警告列表)
     """
-    warnings = []
+    warnings: list[str] = []
 
     # UTF-8 with BOM - 写回时恢复 BOM
     if encoding.lower() == 'utf-8-sig':

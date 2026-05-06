@@ -8,10 +8,13 @@ MCP 文件编码自动转换服务器
 3. 写入文件时自动转回原始编码
 """
 
+from __future__ import annotations
+
 import json
 import asyncio
 import sys
 from pathlib import Path
+from typing import Any
 
 _src_dir = Path(__file__).parent.resolve()
 if str(_src_dir) not in sys.path:
@@ -33,16 +36,16 @@ def _error(error: str) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps({"success": False, "error": error}, ensure_ascii=False))]
 
 
-def _resolve_encoding(file_path_str: str, specified: str | None = None) -> tuple[str | None, list[TextContent] | None]:
-    """确定目标编码，返回 (encoding, None) 或 (None, error_response)"""
+def _resolve_encoding(file_path_str: str, specified: str | None = None) -> tuple[str, list[TextContent] | None]:
+    """确定目标编码，返回 (encoding, None) 或 (placeholder, error_response)"""
     target = specified or get_encoding(file_path_str)
     if not target:
-        return None, _error(
+        return "", _error(
             "未指定编码，且该文件没有之前的编码记录。"
             "请先使用 read_file_with_encoding 读取文件，或手动指定 encoding 参数。"
         )
     if not is_encoding_supported(target):
-        return None, _error(f"不支持的编码: {target}")
+        return "", _error(f"不支持的编码: {target}")
     return target, None
 
 
@@ -77,14 +80,14 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="edit_file_with_encoding",
-            description="局部修改文件（字符串替换），适合小修改。",
+            description="局部修改文件(字符串替换),适合小修改。",
             inputSchema={
                 "type": "object",
                 "properties": {
                     "path": {"type": "string", "description": "文件路径"},
                     "old_string": {"type": "string", "description": "旧文本"},
                     "new_string": {"type": "string", "description": "新文本"},
-                    "encoding": {"type": "string", "description": "编码（可选）"},
+                    "encoding": {"type": "string", "description": "编码(可选)"},
                     "replace_all": {"type": "boolean", "description": "替换所有匹配项"}
                 },
                 "required": ["path", "old_string", "new_string"]
@@ -112,9 +115,35 @@ async def list_tools() -> list[Tool]:
 
 # ── 处理函数 ──────────────────────────────────────────────
 
-async def handle_read_file(arguments: dict) -> list[TextContent]:
+def _str_arg(arguments: dict[str, Any], key: str) -> str:
+    """从 arguments 中取 string 参数"""
+    val = arguments[key]
+    if not isinstance(val, str):
+        raise ValueError(f"参数 {key} 必须是字符串")
+    return val
+
+
+def _optional_str_arg(arguments: dict[str, Any], key: str) -> str | None:
+    """从 arguments 中取可选 string 参数"""
+    val = arguments.get(key)
+    if val is None:
+        return None
+    if not isinstance(val, str):
+        raise ValueError(f"参数 {key} 必须是字符串")
+    return val
+
+
+def _bool_arg(arguments: dict[str, Any], key: str, default: bool = False) -> bool:
+    """从 arguments 中取 bool 参数"""
+    val = arguments.get(key, default)
+    if not isinstance(val, bool):
+        raise ValueError(f"参数 {key} 必须是布尔值")
+    return val
+
+
+async def handle_read_file(arguments: dict[str, Any]) -> list[TextContent]:
     try:
-        file_path = Path(arguments["path"]).resolve()
+        file_path = Path(_str_arg(arguments, "path")).resolve()
 
         if not file_path.exists():
             return _error(f"文件不存在: {file_path}")
@@ -135,7 +164,7 @@ async def handle_read_file(arguments: dict) -> list[TextContent]:
 
         store_encoding(str(file_path), detection.encoding)
 
-        result = {
+        result: dict[str, Any] = {
             "success": True,
             "path": str(file_path),
             "encoding": detection.encoding,
@@ -150,13 +179,13 @@ async def handle_read_file(arguments: dict) -> list[TextContent]:
         return _error(str(e))
 
 
-async def handle_edit_file(arguments: dict) -> list[TextContent]:
+async def handle_edit_file(arguments: dict[str, Any]) -> list[TextContent]:
     try:
-        file_path = Path(arguments["path"]).resolve()
-        old_string = arguments["old_string"]
-        new_string = arguments["new_string"]
-        specified_encoding = arguments.get("encoding")
-        replace_all = arguments.get("replace_all", False)
+        file_path = Path(_str_arg(arguments, "path")).resolve()
+        old_string = _str_arg(arguments, "old_string")
+        new_string = _str_arg(arguments, "new_string")
+        specified_encoding = _optional_str_arg(arguments, "encoding")
+        replace_all = _bool_arg(arguments, "replace_all")
 
         if not file_path.exists():
             return _error(f"文件不存在: {file_path}")
@@ -183,7 +212,7 @@ async def handle_edit_file(arguments: dict) -> list[TextContent]:
 
         write_warnings = write_file_from_utf8(file_path, new_content, target_encoding)
 
-        result = {
+        result: dict[str, Any] = {
             "success": True,
             "path": str(file_path),
             "encoding": target_encoding,
@@ -199,12 +228,12 @@ async def handle_edit_file(arguments: dict) -> list[TextContent]:
         return _error(str(e))
 
 
-async def handle_write_file(arguments: dict) -> list[TextContent]:
+async def handle_write_file(arguments: dict[str, Any]) -> list[TextContent]:
     try:
-        file_path = Path(arguments["path"]).resolve()
-        content = arguments["content"]
+        file_path = Path(_str_arg(arguments, "path")).resolve()
+        content = _str_arg(arguments, "content")
 
-        target_encoding, err = _resolve_encoding(str(file_path), arguments.get("encoding"))
+        target_encoding, err = _resolve_encoding(str(file_path), _optional_str_arg(arguments, "encoding"))
         if err:
             return err
 
@@ -213,7 +242,7 @@ async def handle_write_file(arguments: dict) -> list[TextContent]:
         content_preview = content[:50] + "..." if len(content) > 50 else content
         content_preview = content_preview.replace('\n', ' ').replace('\r', '')
 
-        result = {
+        result: dict[str, Any] = {
             "success": True,
             "path": str(file_path),
             "encoding": target_encoding,
@@ -228,9 +257,9 @@ async def handle_write_file(arguments: dict) -> list[TextContent]:
         return _error(str(e))
 
 
-async def handle_get_encoding(arguments: dict) -> list[TextContent]:
+async def handle_get_encoding(arguments: dict[str, Any]) -> list[TextContent]:
     try:
-        file_path = Path(arguments["path"]).resolve()
+        file_path = Path(_str_arg(arguments, "path")).resolve()
 
         if has_encoding(str(file_path)):
             encoding = get_encoding(str(file_path))
@@ -244,7 +273,7 @@ async def handle_get_encoding(arguments: dict) -> list[TextContent]:
         return _error(str(e))
 
 
-async def handle_list_encodings(arguments: dict) -> list[TextContent]:
+async def handle_list_encodings(arguments: dict[str, Any]) -> list[TextContent]:
     encodings = get_all_encodings()
     return [TextContent(type="text", text=json.dumps({
         "success": True, "encodings": encodings, "count": len(encodings)
@@ -253,7 +282,7 @@ async def handle_list_encodings(arguments: dict) -> list[TextContent]:
 
 # ── 路由分发 ──────────────────────────────────────────────
 
-_TOOL_HANDLERS = {
+_TOOL_HANDLERS: dict[str, Any] = {
     "read_file_with_encoding": handle_read_file,
     "write_file_with_encoding": handle_write_file,
     "edit_file_with_encoding": handle_edit_file,
@@ -263,7 +292,7 @@ _TOOL_HANDLERS = {
 
 
 @server.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
+async def call_tool(name: str, arguments: dict[str, Any]) -> list[TextContent]:
     handler = _TOOL_HANDLERS.get(name)
     if handler:
         return await handler(arguments)
@@ -272,12 +301,12 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
 
 # ── 启动 ──────────────────────────────────────────────────
 
-async def run_server():
+async def run_server() -> None:
     async with stdio_server() as (read_stream, write_stream):
         await server.run(read_stream, write_stream, server.create_initialization_options())
 
 
-def main():
+def main() -> None:
     asyncio.run(run_server())
 
 

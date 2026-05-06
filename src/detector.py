@@ -97,7 +97,10 @@ def detect_encoding(data: bytes) -> EncodingResult:
     try:
         result = charset_normalizer.detect(data)
         if result and result.get('encoding'):
-            encoding = _normalize_encoding(result['encoding'])
+            detected_encoding = result['encoding']
+            if detected_encoding is None:
+                raise ValueError("encoding is None after check")
+            encoding = _normalize_encoding(detected_encoding)
             if _try_decode(data, encoding):
                 confidence = result.get('confidence', 0.9) or 0.9
                 return EncodingResult(encoding=encoding, confidence=confidence)

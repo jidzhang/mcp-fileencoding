@@ -24,7 +24,7 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-from detector import detect_encoding
+from detector import detect_encoding, detect_file_encoding_details, detect_line_ending, EncodingResult
 from converter import decode_to_utf8, read_file_as_utf8, write_file_from_utf8, is_encoding_supported
 from encoding_store import store_encoding, get_encoding, has_encoding, get_all_encodings
 
@@ -66,6 +66,18 @@ async def list_tools() -> list[Tool]:
             }
         ),
         Tool(
+            name="detect_file_encoding",
+            description="只读取前 32KB 探测文件编码与行尾风格，不返回文件内容。"
+                        "用于在不需要全文时快速获知编码和换行符(CRLF/LF)。",
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "description": "文件路径"}
+                },
+                "required": ["path"]
+            }
+        ),
+        Tool(
             name="write_file_with_encoding",
             description="写入文件（自动转回原始编码）。如需局部修改，请优先使用 edit_file_with_encoding。",
             inputSchema={
@@ -88,7 +100,13 @@ async def list_tools() -> list[Tool]:
                     "old_string": {"type": "string", "description": "旧文本"},
                     "new_string": {"type": "string", "description": "新文本"},
                     "encoding": {"type": "string", "description": "编码(可选)"},
-                    "replace_all": {"type": "boolean", "description": "替换所有匹配项"}
+                    "replace_all": {"type": "boolean", "description": "替换所有匹配项"},
+                    "match_line_endings": {
+                        "type": "boolean",
+                        "description": "行尾容错(可选,默认 false)。开启后:若 old_string 逐字节匹配失败,"
+                                       "会按文件主流行尾(CRLF/LF)归一化 old_string 重试一次,new_string 同步按文件行尾写回。"
+                                       "混合行尾或纯 CR 文件不自动归一化。默认关闭以保持字节精确匹配契约。"
+                    }
                 },
                 "required": ["path", "old_string", "new_string"]
             }
@@ -141,6 +159,37 @@ def _bool_arg(arguments: dict[str, Any], key: str, default: bool = False) -> boo
     return val
 
 
+def _probe_and_cache_encoding(file_path: Path) -> tuple[EncodingResult, str]:
+    """探测文件编码与行尾风格（只读前 32KB）并写入缓存，返回 (结果, 行尾风格)。
+
+    供 detect 工具与 get_file_encoding 缓存未命中时共用，保证“探测即缓存”的单一路径。
+    """
+    result, line_ending = detect_file_encoding_details(file_path)
+    store_encoding(str(file_path), result.encoding)
+    return result, line_ending
+
+
+async def handle_detect_file_encoding(arguments: dict[str, Any]) -> list[TextContent]:
+    try:
+        file_path = Path(_str_arg(arguments, "path")).resolve()
+
+        if not file_path.exists():
+            return _error(f"文件不存在: {file_path}")
+
+        result, line_ending = _probe_and_cache_encoding(file_path)
+
+        return [TextContent(type="text", text=json.dumps({
+            "success": True,
+            "path": str(file_path),
+            "encoding": result.encoding,
+            "confidence": result.confidence,
+            "line_ending": line_ending,
+        }, ensure_ascii=False))]
+
+    except Exception as e:
+        return _error(str(e))
+
+
 async def handle_read_file(arguments: dict[str, Any]) -> list[TextContent]:
     try:
         file_path = Path(_str_arg(arguments, "path")).resolve()
@@ -179,6 +228,62 @@ async def handle_read_file(arguments: dict[str, Any]) -> list[TextContent]:
         return _error(str(e))
 
 
+def _to_lf(s: str) -> str:
+    """把字符串的行尾统一成 LF（CRLF 和孤立 CR 都折成 LF）。"""
+    return s.replace('\r\n', '\n').replace('\r', '\n')
+
+
+def _to_crlf(s: str) -> str:
+    """把字符串的行尾统一成 CRLF（先把 CRLF 折成 LF 防止重复补 \\r，再把 \\n 补成 \\r\\n）。"""
+    return s.replace('\r\n', '\n').replace('\n', '\r\n')
+
+
+def _resolve_line_ending_variant(content: str, old_string: str, new_string: str
+                                 ) -> tuple[str, str] | None:
+    """
+    按文件主流行尾把 old_string/new_string 归一化，用于 match_line_endings 容错。
+
+    仅当文件行尾单一（纯 CRLF 或纯 LF）、归一化后的 old_string 确实能在 content 中命中、
+    且与原 old_string 不同（确实需要行尾转换）时，返回 (归一化后的 old, 归一化后的 new)；
+    否则返回 None（混合/无换行/纯 CR 文件、或归一化后仍不匹配、或无需转换）。
+    """
+    le = detect_line_ending(content)
+    if le == 'CRLF':
+        norm_old, norm_new = _to_crlf(old_string), _to_crlf(new_string)
+    elif le == 'LF':
+        norm_old, norm_new = _to_lf(old_string), _to_lf(new_string)
+    else:
+        return None
+    if norm_old != old_string and norm_old in content:
+        return norm_old, norm_new
+    return None
+
+
+def _line_ending_mismatch_hint(content: str, old_string: str) -> str | None:
+    """
+    仅当 old_string 逐字节不在 content 中、但行尾规范化后能匹配时，
+    返回“行尾不一致”的提示；否则返回 None（交由调用方给出通用提示）。
+    本函数只做诊断，不做任何替换或行尾转换，落盘字节不受影响。
+    """
+    if old_string in content:
+        return None
+    if _to_lf(old_string) not in _to_lf(content):
+        return None
+
+    content_is_crlf = '\r\n' in content
+    old_has_lf_only = '\n' in old_string.replace('\r\n', '')
+    if content_is_crlf and old_has_lf_only:
+        return ("未找到要替换的文本：文件使用 CRLF（\\r\\n）换行，但 old_string 用了 LF（\\n）。"
+                "请把 old_string 里的换行改成 \\r\\n 后重试。"
+                "（匹配为逐字节精确匹配，工具不会自动转换行尾。）")
+    if not content_is_crlf and '\r\n' in old_string:
+        return ("未找到要替换的文本：文件使用 LF（\\n）换行，但 old_string 用了 CRLF（\\r\\n）。"
+                "请把 old_string 里的换行改成 \\n 后重试。"
+                "（匹配为逐字节精确匹配，工具不会自动转换行尾。）")
+    return ("未找到要替换的文本：疑似行尾不一致（CRLF/LF）。"
+            "匹配为逐字节精确匹配，请确保 old_string 的换行与文件完全一致（含 \\r）。")
+
+
 async def handle_edit_file(arguments: dict[str, Any]) -> list[TextContent]:
     try:
         file_path = Path(_str_arg(arguments, "path")).resolve()
@@ -186,6 +291,7 @@ async def handle_edit_file(arguments: dict[str, Any]) -> list[TextContent]:
         new_string = _str_arg(arguments, "new_string")
         specified_encoding = _optional_str_arg(arguments, "encoding")
         replace_all = _bool_arg(arguments, "replace_all")
+        match_line_endings = _bool_arg(arguments, "match_line_endings")
 
         if not file_path.exists():
             return _error(f"文件不存在: {file_path}")
@@ -196,21 +302,30 @@ async def handle_edit_file(arguments: dict[str, Any]) -> list[TextContent]:
 
         content, read_warnings = read_file_as_utf8(file_path, target_encoding)
 
+        # 逐字节精确匹配优先。失败时若开启 match_line_endings，按文件主流行尾
+        # 归一化 old_string 重试一次（new_string 同步归一化，保证写入行尾与文件一致）。
+        # 混合/无换行/纯 CR 的文件不归一化，交由行尾诊断提示。
+        matched_old, matched_new = old_string, new_string
         if old_string not in content:
-            return _error("未找到要替换的文本，请检查 old_string 是否准确")
+            variant = _resolve_line_ending_variant(content, old_string, new_string) if match_line_endings else None
+            if variant is None:
+                hint = _line_ending_mismatch_hint(content, old_string)
+                return _error(hint or "未找到要替换的文本，请检查 old_string 是否准确")
+            matched_old, matched_new = variant
 
-        count = content.count(old_string)
+        count = content.count(matched_old)
         if count > 1 and not replace_all:
             return _error(f"要替换的文本出现了 {count} 次。请提供更具体的上下文，或设置 replace_all=true")
 
         if replace_all:
-            new_content = content.replace(old_string, new_string)
+            new_content = content.replace(matched_old, matched_new)
             actual_count = count
         else:
-            new_content = content.replace(old_string, new_string, 1)
+            new_content = content.replace(matched_old, matched_new, 1)
             actual_count = 1
 
         write_warnings = write_file_from_utf8(file_path, new_content, target_encoding)
+        store_encoding(str(file_path), target_encoding)
 
         result: dict[str, Any] = {
             "success": True,
@@ -238,6 +353,7 @@ async def handle_write_file(arguments: dict[str, Any]) -> list[TextContent]:
             return err
 
         warnings = write_file_from_utf8(file_path, content, target_encoding)
+        store_encoding(str(file_path), target_encoding)
 
         content_preview = content[:50] + "..." if len(content) > 50 else content
         content_preview = content_preview.replace('\n', ' ').replace('\r', '')
@@ -261,13 +377,21 @@ async def handle_get_encoding(arguments: dict[str, Any]) -> list[TextContent]:
     try:
         file_path = Path(_str_arg(arguments, "path")).resolve()
 
-        if has_encoding(str(file_path)):
-            encoding = get_encoding(str(file_path))
+        if not file_path.exists():
+            return _error(f"文件不存在: {file_path}")
+
+        key = str(file_path)
+        if has_encoding(key):
+            encoding = get_encoding(key)
             return [TextContent(type="text", text=json.dumps({
-                "success": True, "path": str(file_path), "encoding": encoding
+                "success": True, "path": key, "encoding": encoding
             }, ensure_ascii=False))]
-        else:
-            return _error("该文件没有编码记录。请先使用 read_file_with_encoding 读取文件。")
+
+        # 无缓存记录但文件存在：按需探测（只读前 32KB），结果写入缓存供后续复用
+        result, _ = _probe_and_cache_encoding(file_path)
+        return [TextContent(type="text", text=json.dumps({
+            "success": True, "path": key, "encoding": result.encoding
+        }, ensure_ascii=False))]
 
     except Exception as e:
         return _error(str(e))
@@ -284,6 +408,7 @@ async def handle_list_encodings(arguments: dict[str, Any]) -> list[TextContent]:
 
 _TOOL_HANDLERS: dict[str, Any] = {
     "read_file_with_encoding": handle_read_file,
+    "detect_file_encoding": handle_detect_file_encoding,
     "write_file_with_encoding": handle_write_file,
     "edit_file_with_encoding": handle_edit_file,
     "get_file_encoding": handle_get_encoding,

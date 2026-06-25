@@ -210,3 +210,37 @@ class TestBomOrdering:
         data = codecs.BOM_UTF32_BE + "中文内容测试".encode("utf-32-be")
         result = detect_encoding(data)
         assert result.encoding == "utf-32-be"
+
+
+class TestDetectionPerformance:
+    """检测的性能优化:charset-normalizer 只吃有限样本(大文件不再 O(n));
+    UTF-8 高位字节走严格解码快路径,完全不进 charset-normalizer。
+    GBK/gb18030 不设严格解码快路径——它们对异种 CJK(SJIS/Big5)与孤立字节过于宽松,
+    会破坏既有的精细检测策略(见 TestSingleByteMisclassification / TestGb18030Fallback)。"""
+
+    def test_charset_normalizer_only_gets_bounded_sample(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import charset_normalizer
+        import detector
+        seen: list[int] = []
+        real_detect = charset_normalizer.detect
+
+        def spy(d: bytes) -> dict:
+            seen.append(len(d))
+            return real_detect(d)
+
+        monkeypatch.setattr(charset_normalizer, "detect", spy)
+        data = ("中文内容用于检测测试验证稳定可靠" * 5000).encode("gbk")
+        assert len(data) > detector._CN_SAMPLE
+        detector.detect_encoding(data)
+        assert seen, "charset-normalizer 应至少被调用一次"
+        assert max(seen) <= detector._CN_SAMPLE
+
+    def test_utf8_high_byte_skips_charset_normalizer(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        import charset_normalizer
+        called: list[int] = []
+        monkeypatch.setattr(charset_normalizer, "detect",
+                            lambda d: called.append(1) or {"encoding": None})
+        data = ("中文内容用于检测测试验证" * 100).encode("utf-8")
+        result = detect_encoding(data)
+        assert result.encoding == "utf-8"
+        assert called == [], "UTF-8 高位字节应走快路径,不应调用 charset-normalizer"

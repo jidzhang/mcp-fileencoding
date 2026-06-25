@@ -29,6 +29,10 @@ _BOM_MAP = [
 # 用于快速检测高位字节
 _DEL_ASCII = bytes(range(128))
 
+# charset-normalizer 只喂前 64KB:其判断在几十 KB 后即饱和,喂全量只带来 O(n) 开销
+# (2MB GBK 全量检测 ~138ms,限样本 ~2ms),且 GBK 优先/gb18030 兜底的严格校验仍跑全量。
+_CN_SAMPLE = 65536
+
 
 def _detect_by_bom(data: bytes) -> str | None:
     """通过 BOM 检测编码"""
@@ -107,9 +111,16 @@ def detect_encoding(data: bytes) -> EncodingResult:
         # 纯 ASCII，使用 UTF-8
         return EncodingResult(encoding='utf-8', confidence=1.0)
 
-    # 使用 charset-normalizer 检测
+    # UTF-8 快路径:严格解码整段成功 ⇒ 确为 UTF-8。UTF-8 是严格编码,GBK/SJIS/Big5 等
+    # 的高位字节几乎不可能整段凑成合法 UTF-8,故解码成功即无歧义,无需 charset-normalizer。
+    # 注:仅此一种严格解码快路径安全——GBK/gb18030 过于宽松(会吞孤立 0x80、误吞异种 CJK),
+    # 仍交由下方 charset-normalizer + GBK 优先 + gb18030 兜底的既有精细逻辑处理。
+    if _try_decode(data, 'utf-8'):
+        return EncodingResult(encoding='utf-8', confidence=1.0)
+
+    # charset-normalizer 检测(只喂前 _CN_SAMPLE 字节,判断精度在几十 KB 后即饱和)
     try:
-        result = charset_normalizer.detect(data)
+        result = charset_normalizer.detect(data[:_CN_SAMPLE])
         if result and result.get('encoding'):
             detected_encoding = result['encoding']
             if detected_encoding is None:

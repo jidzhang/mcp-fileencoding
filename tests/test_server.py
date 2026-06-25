@@ -177,6 +177,33 @@ class TestWriteFile:
         # 文件未被损坏
         assert file.read_bytes() == "中文原始内容".encode("gbk")
 
+    def test_write_utf8_bom_preserved_when_encoding_param_is_plain_utf8(
+        self, tmp_path: pytest.TempPathFactory
+    ) -> None:
+        # 已存在的带 BOM 文件，调用方误传 encoding="utf-8" 写入 → 应保住 BOM 并提示
+        file = tmp_path / "bom.txt"  # type: ignore[operator]
+        file.write_bytes(b'\xef\xbb\xbf' + "原始带BOM的UTF-8中文内容，足够长。".encode("utf-8"))
+
+        result = run(handle_write_file({
+            "path": str(file), "encoding": "utf-8",
+            "content": "新写入的UTF-8中文内容，足够长以供测试验证。",
+        }))
+        data = _parse(result[0].text)
+        assert data["success"] is True
+        assert file.read_bytes().startswith(b'\xef\xbb\xbf')
+        assert data["encoding"] == "utf-8-sig"
+        assert any("utf-8-sig" in w for w in data.get("warnings", []))
+
+    def test_write_new_file_utf8_does_not_add_bom(self, tmp_path: pytest.TempPathFactory) -> None:
+        # 回归：新建文件（无既有 BOM 可保）+ encoding="utf-8" → 不应被误加 BOM
+        file = tmp_path / "new.txt"  # type: ignore[operator]
+        result = run(handle_write_file({
+            "path": str(file), "encoding": "utf-8", "content": "新建的UTF-8内容。",
+        }))
+        data = _parse(result[0].text)
+        assert data["success"] is True
+        assert file.read_bytes() == "新建的UTF-8内容。".encode("utf-8")
+
 
 class TestEditFile:
     def test_edit_gbk_file(self, tmp_path: pytest.TempPathFactory) -> None:
@@ -293,6 +320,31 @@ class TestEditFile:
         data = _parse(result[0].text)
         assert data["success"] is False
         assert file.read_bytes() == "中文旧词内容".encode("gbk")
+
+    def test_edit_utf8_bom_preserved_when_encoding_param_is_plain_utf8(
+        self, tmp_path: pytest.TempPathFactory
+    ) -> None:
+        # bug 复现：文件实际带 UTF-8 BOM，但调用方误传 encoding="utf-8"。
+        # 写回应以文件实际字节为准保住 BOM（否则丢失 BOM，引发 MSVC C4819），
+        # 并在 warnings 中提示编码已被纠正。
+        file = tmp_path / "bom.txt"  # type: ignore[operator]
+        file.write_bytes(
+            b'\xef\xbb\xbf' + "这是一段足够长的中文内容用于测试BOM保留特性。\r\n第二行中文内容继续。\r\n".encode("utf-8")
+        )
+
+        result = run(handle_edit_file({
+            "path": str(file), "encoding": "utf-8",
+            "old_string": "测试", "new_string": "验证",
+        }))
+        data = _parse(result[0].text)
+        assert data["success"] is True
+        # BOM 必须保留
+        assert file.read_bytes().startswith(b'\xef\xbb\xbf')
+        # 应提示编码已纠正为 utf-8-sig
+        warnings = data.get("warnings", [])
+        assert any("utf-8-sig" in w for w in warnings)
+        # 缓存也应是 utf-8-sig，避免后续操作再次丢 BOM
+        assert data["encoding"] == "utf-8-sig"
 
 
 class TestEditMatchLineEndings:
@@ -504,3 +556,55 @@ class TestCallTool:
         data = _parse(result[0].text)
         assert data["success"] is False
         assert "未知工具" in data["error"]
+
+
+class TestReadCacheFreshness:
+    """read 的检测缓存:文件未改动时跳过检测;文件改动后重新检测。"""
+
+    def test_read_skips_detection_when_file_unchanged(
+        self, tmp_path: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        file = tmp_path / "f.txt"  # type: ignore[operator]
+        file.write_bytes(_GBK_TEXT.encode("gbk"))
+        # 首次读:检测并缓存(含 mtime/size 快照)
+        run(handle_read_file({"path": str(file)}))
+
+        import server
+        def boom(d: bytes) -> None:
+            raise AssertionError("文件未改动,不应再次调用检测")
+        # server.py 用 from detector import detect_encoding 绑定了名字,需 patch server 上的引用
+        monkeypatch.setattr(server, "detect_encoding", boom)
+
+        result = run(handle_read_file({"path": str(file)}))
+        data = _parse(result[0].text)
+        assert data["success"] is True
+        assert data["encoding"] in ("gbk", "gb18030")
+
+    def test_read_redetects_when_file_changed(
+        self, tmp_path: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        file = tmp_path / "f.txt"  # type: ignore[operator]
+        file.write_bytes(_GBK_TEXT.encode("gbk"))
+        run(handle_read_file({"path": str(file)}))
+
+        # 改动文件:不同内容,并强制推进 mtime,确保新鲜度判定失效
+        import os
+        import time
+        file.write_bytes("完全不同的新中文内容,足够长以供检测稳定可靠验证。".encode("gbk"))
+        future = time.time() + 100
+        os.utime(file, (future, future))
+
+        calls: list[int] = []
+        import server
+        real = server.detect_encoding
+
+        def spy(d: bytes):
+            calls.append(len(d))
+            return real(d)
+
+        monkeypatch.setattr(server, "detect_encoding", spy)
+
+        result = run(handle_read_file({"path": str(file)}))
+        data = _parse(result[0].text)
+        assert data["success"] is True
+        assert calls, "文件已改动,应重新调用检测"

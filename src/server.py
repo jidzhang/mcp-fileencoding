@@ -26,7 +26,9 @@ from mcp.types import Tool, TextContent
 
 from detector import detect_encoding, detect_file_encoding_details, detect_line_ending, EncodingResult
 from converter import decode_to_utf8, read_file_as_utf8, write_file_from_utf8, is_encoding_supported
-from encoding_store import store_encoding, get_encoding, has_encoding, get_all_encodings
+from encoding_store import (
+    store_encoding, get_encoding, has_encoding, get_all_encodings, get_fresh_encoding,
+)
 
 server = Server("encoding-server")
 
@@ -47,6 +49,36 @@ def _resolve_encoding(file_path_str: str, specified: str | None = None) -> tuple
     if not is_encoding_supported(target):
         return "", _error(f"不支持的编码: {target}")
     return target, None
+
+
+_UTF8_BOM = b'\xef\xbb\xbf'
+
+
+def _reconcile_utf8_bom(file_path: Path, target_encoding: str) -> tuple[str, list[str]]:
+    """以文件实际字节为准：已存在的文件若实际带 UTF-8 BOM，但目标编码是普通 utf-8，
+    纠正为 utf-8-sig 以保住 BOM。
+
+    防止调用方误传 encoding='utf-8' 导致写回时不补 EF BB BF、BOM 被静默丢弃，
+    进而引发 MSVC C4819 等警告。仅对普通 utf-8 生效：utf-8-sig 本就会补 BOM，
+    UTF-16/32/GBK 等与 UTF-8 BOM 无关，均不受影响。新建文件（尚不存在）无既有
+    BOM 可核对，按调用方传入的 encoding 办。返回 (纠正后的编码, 警告列表)。
+    """
+    warnings: list[str] = []
+    if target_encoding.lower() != 'utf-8':
+        return target_encoding, warnings
+    try:
+        with open(file_path, 'rb') as f:
+            head = f.read(3)
+    except OSError:
+        # 文件不存在（新建）或不可读：无既有 BOM 可核对，按原 encoding 办
+        return target_encoding, warnings
+    if head == _UTF8_BOM:
+        warnings.append(
+            "文件实际带 UTF-8 BOM，写入编码已从 utf-8 纠正为 utf-8-sig 以保留 BOM"
+            "（传 encoding='utf-8' 会丢失 BOM，可能引发编译器 C4819 警告）。"
+        )
+        return 'utf-8-sig', warnings
+    return target_encoding, warnings
 
 
 # ── 工具定义 ──────────────────────────────────────────────
@@ -165,7 +197,7 @@ def _probe_and_cache_encoding(file_path: Path) -> tuple[EncodingResult, str]:
     供 detect 工具与 get_file_encoding 缓存未命中时共用，保证“探测即缓存”的单一路径。
     """
     result, line_ending = detect_file_encoding_details(file_path)
-    store_encoding(str(file_path), result.encoding)
+    store_encoding(str(file_path), result.encoding, result.confidence)
     return result, line_ending
 
 
@@ -208,16 +240,24 @@ async def handle_read_file(arguments: dict[str, Any]) -> list[TextContent]:
                 "encoding": "utf-8", "confidence": 1.0, "content": "",
             }, ensure_ascii=False))]
 
-        detection = detect_encoding(raw_data)
-        content, warnings = decode_to_utf8(raw_data, detection.encoding)
+        # 命中未改动缓存(自上次检测以来 mtime/size 未变)则跳过检测,直接复用编码。
+        # 大文件检测是大头(2MB GBK ~138ms),避免每次 read 都重算。
+        cached = get_fresh_encoding(str(file_path))
+        if cached is not None:
+            encoding, confidence = cached
+        else:
+            detection = detect_encoding(raw_data)
+            encoding, confidence = detection.encoding, detection.confidence
 
-        store_encoding(str(file_path), detection.encoding)
+        content, warnings = decode_to_utf8(raw_data, encoding)
+
+        store_encoding(str(file_path), encoding, confidence)
 
         result: dict[str, Any] = {
             "success": True,
             "path": str(file_path),
-            "encoding": detection.encoding,
-            "confidence": detection.confidence,
+            "encoding": encoding,
+            "confidence": confidence,
             "content": content,
         }
         if warnings:
@@ -299,6 +339,7 @@ async def handle_edit_file(arguments: dict[str, Any]) -> list[TextContent]:
         target_encoding, err = _resolve_encoding(str(file_path), specified_encoding)
         if err:
             return err
+        target_encoding, bom_warning = _reconcile_utf8_bom(file_path, target_encoding)
 
         content, read_warnings = read_file_as_utf8(file_path, target_encoding)
 
@@ -334,7 +375,7 @@ async def handle_edit_file(arguments: dict[str, Any]) -> list[TextContent]:
             "replacements": actual_count,
             "message": f"已替换 {actual_count} 处，编码: {target_encoding}",
         }
-        all_warnings = read_warnings + write_warnings
+        all_warnings = bom_warning + read_warnings + write_warnings
         if all_warnings:
             result["warnings"] = all_warnings
         return [TextContent(type="text", text=json.dumps(result, ensure_ascii=False))]
@@ -351,8 +392,9 @@ async def handle_write_file(arguments: dict[str, Any]) -> list[TextContent]:
         target_encoding, err = _resolve_encoding(str(file_path), _optional_str_arg(arguments, "encoding"))
         if err:
             return err
+        target_encoding, bom_warning = _reconcile_utf8_bom(file_path, target_encoding)
 
-        warnings = write_file_from_utf8(file_path, content, target_encoding)
+        warnings = bom_warning + write_file_from_utf8(file_path, content, target_encoding)
         store_encoding(str(file_path), target_encoding)
 
         content_preview = content[:50] + "..." if len(content) > 50 else content

@@ -7,7 +7,7 @@
         "hooks": [
           {
             "type": "prompt",
-            "prompt": "检查 $ARGUMENTS 中的文件路径，如果文件扩展名是 .cpp、.h 或 .lsp，则：\n- 对于 Read 操作：使用 mcp__fileencoding__read_file_with_encoding 代替 Read 工具\n- 对于 Write/Edit 操作：使用 mcp__fileencoding__write_file_with_encoding 代替 Write/Edit 工具\n\n返回 JSON: {\"hookSpecificOutput\": {\"hookEventName\": \"PreToolUse\", \"additionalContext\": \"提示信息\"}}"
+            "prompt": "检查 $ARGUMENTS 中的文件路径，如果文件扩展名是 .cpp、.h 或 .lsp，则：\n- 对于 Read 操作：使用 mcp__fileencoding__read_file_with_encoding 代替 Read 工具\n- 对于 Edit 操作：使用 mcp__fileencoding__edit_file_with_encoding 代替 Edit 工具\n- 对于 Write 操作：使用 mcp__fileencoding__write_file_with_encoding 代替 Write 工具\n\n返回 JSON: {\"hookSpecificOutput\": {\"hookEventName\": \"PreToolUse\", \"additionalContext\": \"提示信息\"}}"
           }
         ]
       }

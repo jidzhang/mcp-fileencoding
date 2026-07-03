@@ -17,7 +17,7 @@
 
 3. **UTF-8 BOM 保护**:`edit` / `write` 对**已存在**的带 BOM 文件,以文件实际字节为准——即使调用方误传 `encoding="utf-8"`,也会纠正为 `utf-8-sig` 保住 BOM 并在 `warnings` 提示(见 `src/server.py` 的 `_reconcile_utf8_bom`)。防止丢 BOM 引发 MSVC C4819 等警告。改此逻辑必须同步更新 `tests/test_server.py` 的 BOM 用例。
 
-4. **精确匹配**:`edit` 默认对 `old_string` 逐字节精确匹配(含换行符);多次出现且未设 `replace_all` 时报错拒绝,不擅自替换。
+4. **精确匹配**:`edit` 默认对 `old_string` 逐字节精确匹配(含换行符);多次出现且未设 `replace_all` 时报错拒绝,不擅自替换。`match_line_endings` / `match_indent` 容错开关默认关闭,开启后仅在逐字节匹配失败时作为兜底重试(见下),绝不破坏字节保真契约——容错只影响被替换区,区外字节逐字节不变。
 
 ## 编码检测内部机制(`src/detector.py`)
 
@@ -46,7 +46,7 @@
 
 | 文件 | 职责 | 关键函数 |
 |------|------|---------|
-| `src/server.py` | MCP 入口、6 个工具定义与 handler、路由 | `_resolve_encoding`(编码解析:参数>缓存>报错)、`_reconcile_utf8_bom`(写前按实际字节保护 UTF-8 BOM)、`_resolve_line_ending_variant`/`_line_ending_mismatch_hint`(行尾容错与诊断) |
+| `src/server.py` | MCP 入口、6 个工具定义与 handler、路由 | `_resolve_encoding`(编码解析:参数>缓存>报错)、`_reconcile_utf8_bom`(写前按实际字节保护 UTF-8 BOM)、`_resolve_line_ending_variant`/`_line_ending_mismatch_hint`(行尾容错与诊断)、`_resolve_indent_variant`(前导缩进容错) |
 | `src/detector.py` | 编码与行尾探测 | `detect_encoding`、`_detect_by_bom`、`detect_file_encoding_details`(32KB)、`detect_line_ending` |
 | `src/converter.py` | 字节 ↔ UTF-8 转换,手动处理 BOM | `decode_to_utf8`、`encode_from_utf8`、`read_file_as_utf8`、`write_file_from_utf8` |
 | `src/encoding_store.py` | 内存编码缓存 | `store_encoding`、`get_encoding`、`get_all_encodings`、`clear_all` |
@@ -59,11 +59,12 @@ npx pyright src/        # strict 模式,源码必须零错误
 ```
 
 - 测试靠 `pyproject.toml` 的 `pythonpath=["src"]` 解析模块;pyright `include=["src"]` 不分析 tests 目录,故测试文件的导入告警属预期,不代表运行错误。
-- 各测试文件职责:`test_byte_fidelity.py`(字节往返与行尾保留契约护栏)、`test_server.py`(工具端到端,含 BOM、行尾容错、不篡改拒绝)、`test_detector.py`(检测分层逻辑)、`test_converter.py`(转换往返)、`test_encoding_store.py`(缓存增删查淘汰)。
+- 各测试文件职责:`test_byte_fidelity.py`(字节往返与行尾保留契约护栏,含 match_line_endings / match_indent 的字节保真)、`test_server.py`(工具端到端,含 BOM、行尾容错、前导缩进容错、不篡改拒绝)、`test_detector.py`(检测分层逻辑)、`test_converter.py`(转换往返)、`test_encoding_store.py`(缓存增删查淘汰)。
 
 ## 当前实现状态备注
 
 - 按需探测:`detect_file_encoding` 工具 + `get_file_encoding` 缓存未命中时探测(32KB)。
 - 行尾容错:`edit` 的 `match_line_endings`,精确匹配失败时按文件主流行尾归一化 old/new 重试一次(混合行尾不自动归一化)。
+- 前导缩进容错:`edit` 的 `match_indent`,精确匹配与行尾容错均失败后,按"逐行去掉前导空白后的内容 + 相对首行的缩进列宽(制表位 8)"整行比对,容忍深层 tab/空格缩进的计数偏差。命中后写回 new_string 时,用文件该区域每行的实际前导空白逐行替换 new_string 的前导空白(保留 tab/空格风格与缩进深度);new_string 多出的行继承末行缩进,空行保持为空。多义(去前导空白后仍多处内容相同)一律报错,即便 `replace_all=true` 也不擅自批量替换。仅整行对齐的匹配参与(片段式替换走精确匹配);对 CRLF/LF 行尾差异同样有效。实现见 `_resolve_indent_variant`,测试见 `tests/test_server.py::TestEditMatchIndent` 与 `tests/test_byte_fidelity.py::TestEditMatchIndentByteFidelity`。
 - UTF-8 BOM 保护:edit/write 写已存在的带 BOM 文件时,即使误传 `encoding="utf-8"` 也会纠正为 `utf-8-sig` 保住 BOM 并提示(`_reconcile_utf8_bom`)。
 - 检测提速:UTF-8 走严格解码快路径;charset-normalizer 只喂前 64KB(2MB GBK 检测 ~138ms → ~8ms);`read` 命中未改动缓存时跳过检测。GBK/gb18030 不设严格解码快路径(会破坏异种 CJK 与孤立字节的精细判定)。

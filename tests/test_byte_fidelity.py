@@ -211,6 +211,55 @@ class TestEditMatchLineEndingsByteFidelity:
         assert new_sub.encode("gbk") not in after
 
 
+# ── match_indent：缩进容错仍只动被替换区，缩进/行尾随文件 ─────────
+
+class TestEditMatchIndentByteFidelity:
+    """match_indent=True 时，替换区外字节逐字节不变；被替换区写入的缩进（tab 数）
+    与行尾（CRLF）都与文件一致，不被 new_string 里的错误值污染。"""
+
+    def test_indent_tolerant_replace_preserves_outside_bytes(self, tmp_path) -> None:
+        # 用显式乘法构造 tab，避免字面量数 tab 出错。
+        t4 = "\t" * 4
+        t3 = "\t" * 3
+        t2 = "\t" * 2
+        text = (
+            "这是开头足够长的中文内容用于检测稳定。\r\n"
+            + t4 + "oldFunc(arg);\r\n"     # 文件：4 tab
+            + t3 + "nextLine();\r\n"       # 文件：3 tab
+            + "这是结尾中文内容。\r\n"
+        )
+        file = tmp_path / "f.txt"
+        original = text.encode("gbk")
+        file.write_bytes(original)
+
+        # 模型两行都少算 1 个 tab（3/2 而非 4/3），相对缩进结构一致；用 LF。
+        # 多行 under-count 不会被子串精确命中，故走到缩进容错路径。
+        old_sub = t3 + "oldFunc(arg);\n" + t2 + "nextLine();"
+        new_sub = t3 + "oldFunc(NEW);\n" + t2 + "newLine();"
+
+        res = run(handle_edit_file({
+            "path": str(file), "encoding": "gbk",
+            "old_string": old_sub, "new_string": new_sub,
+            "match_indent": True,
+        }))
+        assert _parse(res[0].text)["success"] is True
+
+        after = file.read_bytes()
+        # 期望：替换区写成文件实际的 4/3 tab + CRLF；区外字节原样
+        expected_text = (
+            "这是开头足够长的中文内容用于检测稳定。\r\n"
+            + t4 + "oldFunc(NEW);\r\n"
+            + t3 + "newLine();\r\n"
+            + "这是结尾中文内容。\r\n"
+        )
+        assert after == expected_text.encode("gbk")
+        # 行尾全部仍是 CRLF，计数不变
+        assert after.count(b"\r\n") == original.count(b"\r\n")
+        assert after.count(b"\n") == original.count(b"\n")
+        # 模型给的 LF 版本不应原样落盘
+        assert new_sub.encode("gbk") not in after
+
+
 # ── converter 层：decode→encode 逐字节一致（无 BOM 时） ───────────
 
 class TestConverterByteIdentity:

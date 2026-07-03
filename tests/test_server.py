@@ -466,6 +466,282 @@ class TestEditMatchLineEndings:
         assert "OK\r\nNEXT" in content
 
 
+class TestEditMatchIndent:
+    """match_indent 开关：精确匹配与行尾容错均失败后，按“逐行去前导空白后的内容 +
+    相对缩进层级”整行匹配，容忍深层 tab/空格缩进的计数偏差。命中后写回时用文件实际
+    前导空白逐行替换 new_string 的前导空白。默认关闭，契约不变。"""
+
+    def test_deep_tab_off_by_one_succeeds(self, tmp_path: pytest.TempPathFactory) -> None:
+        # 文件 6/5 层 tab；模型少写 1 个 tab 给 old/new（5/4 层）→ 容错命中，
+        # 写回用文件实际的 6/5 层 tab。多行 under-count 不会被子串精确命中。
+        t6, t5, t4 = "\t" * 6, "\t" * 5, "\t" * 4
+        file = tmp_path / "deep.txt"  # type: ignore[operator]
+        file.write_bytes(
+            ("void f() {\n"
+             + t6 + "targetCall(arg);\n"
+             + t5 + "siblingLine();\n"
+             + "}\n").encode("gbk")
+        )
+        run(handle_read_file({"path": str(file)}))
+
+        result = run(handle_edit_file({
+            "path": str(file),
+            "old_string": t5 + "targetCall(arg);\n" + t4 + "siblingLine();",
+            "new_string": t5 + "targetCall(arg, X);\n" + t4 + "siblingLineRenamed();",
+            "match_indent": True,
+        }))
+        data = _parse(result[0].text)
+        assert data["success"] is True
+        assert data["replacements"] == 1
+
+        content, _ = converter.read_file_as_utf8(file, data["encoding"])
+        # 写回应是文件实际的 6/5 层 tab，而非模型的 5/4 层
+        assert (t6 + "targetCall(arg, X);\n") in content
+        assert (t5 + "siblingLineRenamed();\n") in content
+        # 不应出现 7 层（说明没多加）
+        assert ("\t" * 7 + "targetCall") not in content
+
+    def test_tab_style_preserved_against_space_old(self, tmp_path: pytest.TempPathFactory) -> None:
+        # 文件用 tab，old/new 用同视觉宽度的空格：命中后写回仍用 tab（保留文件风格）。
+        file = tmp_path / "tabs.txt"  # type: ignore[operator]
+        file.write_bytes("\tfoo\n\t\tbar\n".encode("gbk"))
+        run(handle_read_file({"path": str(file)}))
+
+        # 8 空格 ≈ 1 tab、16 空格 ≈ 2 tab（制表位 8）
+        result = run(handle_edit_file({
+            "path": str(file),
+            "old_string": "        foo\n                bar",
+            "new_string": "        NEWFOO\n                NEWBAR",
+            "match_indent": True,
+        }))
+        data = _parse(result[0].text)
+        assert data["success"] is True
+        content, _ = converter.read_file_as_utf8(file, data["encoding"])
+        # 写回用 tab，不是空格
+        assert "\tNEWFOO\n\t\tNEWBAR\n" in content
+        assert "        NEWFOO" not in content
+
+    def test_ambiguous_refuses(self, tmp_path: pytest.TempPathFactory) -> None:
+        # 两处去前导空白后内容与相对缩进均相同（仅绝对深度不同）→ 多义报错，不改文件。
+        text = (
+            "start\n"
+            "\t\tA1\n"        # 2 tab
+            "\t\t\tA2\n"      # 3 tab（相对 +1 tab）
+            "mid\n"
+            "\t\t\t\tA1\n"    # 4 tab
+            "\t\t\t\t\tA2\n"  # 5 tab（相对 +1 tab）
+            "end\n"
+        )
+        file = tmp_path / "amb.txt"  # type: ignore[operator]
+        file.write_bytes(text.encode("gbk"))
+        run(handle_read_file({"path": str(file)}))
+
+        result = run(handle_edit_file({
+            "path": str(file),
+            "old_string": "\tA1\n\t\tA2",  # 模型给的绝对深度与两处都不精确
+            "new_string": "\tB1\n\t\tB2",
+            "match_indent": True,
+        }))
+        data = _parse(result[0].text)
+        assert data["success"] is False
+        assert "多处" in data["error"]
+        # 文件未改动
+        assert file.read_bytes() == text.encode("gbk")
+
+    def test_relative_indent_required_swapped_not_matched(
+        self, tmp_path: pytest.TempPathFactory
+    ) -> None:
+        # 文件 X 比 Y 深；old 给的相对关系反了（X 比 Y 浅）→ 相对缩进不一致，不命中。
+        text = "\t\tX\n\tY\n"  # X=2 tab, Y=1 tab
+        file = tmp_path / "sw.txt"  # type: ignore[operator]
+        file.write_bytes(text.encode("gbk"))
+        run(handle_read_file({"path": str(file)}))
+
+        result = run(handle_edit_file({
+            "path": str(file),
+            "old_string": "\tX\n\t\tY",  # 相对关系与文件相反
+            "new_string": "\tXX\n\t\tYY",
+            "match_indent": True,
+        }))
+        data = _parse(result[0].text)
+        assert data["success"] is False
+        assert file.read_bytes() == text.encode("gbk")
+
+    def test_genuinely_missing_fails(self, tmp_path: pytest.TempPathFactory) -> None:
+        text = "\t\tfoo\n\t\tbar\n"
+        file = tmp_path / "x.txt"  # type: ignore[operator]
+        file.write_bytes(text.encode("gbk"))
+        run(handle_read_file({"path": str(file)}))
+
+        result = run(handle_edit_file({
+            "path": str(file),
+            "old_string": "\t\t不存在的内容XYZ\n\t\t第二行也没有",
+            "new_string": "\t\t替换",
+            "match_indent": True,
+        }))
+        data = _parse(result[0].text)
+        assert data["success"] is False
+        assert file.read_bytes() == text.encode("gbk")
+
+    def test_exact_match_bypasses_indent_path(self, tmp_path: pytest.TempPathFactory) -> None:
+        # old_string 已能精确匹配时，即使开启 match_indent 也不做缩进改写：
+        # new_string 原样写入（包括模型给的缩进）。
+        text = "\t\toldContent\n\tnext\n"
+        file = tmp_path / "e.txt"  # type: ignore[operator]
+        file.write_bytes(text.encode("gbk"))
+        run(handle_read_file({"path": str(file)}))
+
+        result = run(handle_edit_file({
+            "path": str(file),
+            "old_string": "\t\toldContent",  # 精确匹配
+            "new_string": "\tnewContent",     # 故意给不同的缩进，应原样写入
+            "match_indent": True,
+        }))
+        data = _parse(result[0].text)
+        assert data["success"] is True
+        content, _ = converter.read_file_as_utf8(file, data["encoding"])
+        # 精确匹配路径：new_string 原样落盘（缩进未被文件实际值替换）
+        assert "\tnewContent\n" in content
+        assert "\t\toldContent" not in content
+
+    def test_extra_new_lines_inherit_last_indent(
+        self, tmp_path: pytest.TempPathFactory
+    ) -> None:
+        # new_string 比 old 多一行：多出的行继承 old 末行的文件实际缩进。
+        # old 两行都少算 1 tab（保持相对结构一致）→ 多行 under-count 非子串，走缩进路径。
+        t2, t1 = "\t" * 2, "\t" * 1
+        file = tmp_path / "extra.txt"  # type: ignore[operator]
+        file.write_bytes((t2 + "a();\n" + t2 + "b();\n").encode("gbk"))
+        run(handle_read_file({"path": str(file)}))
+
+        result = run(handle_edit_file({
+            "path": str(file),
+            "old_string": t1 + "a();\n" + t1 + "b();",
+            "new_string": t1 + "a();\n" + t1 + "b();\n" + t1 + "c();",  # 末行多出 c()
+            "match_indent": True,
+        }))
+        data = _parse(result[0].text)
+        assert data["success"] is True
+        content, _ = converter.read_file_as_utf8(file, data["encoding"])
+        # 三行都用文件实际的 2 tab
+        assert (t2 + "a();\n" + t2 + "b();\n" + t2 + "c();\n") in content
+
+    def test_blank_new_line_stays_blank(self, tmp_path: pytest.TempPathFactory) -> None:
+        # new_string 含空行：空行保持为空，不被注入文件缩进导致的行尾空白。
+        # 用 over-count（3 tab vs 文件 2 tab）触发缩进路径（under-count 会因子串前缀
+        # 精确命中而走不到缩进路径）。
+        file = tmp_path / "blank.txt"  # type: ignore[operator]
+        file.write_bytes("\t\tfoo();\n".encode("gbk"))
+        run(handle_read_file({"path": str(file)}))
+
+        result = run(handle_edit_file({
+            "path": str(file),
+            "old_string": "\t\t\tfoo();",  # 模型多算 1 tab
+            "new_string": "\t\t\tfoo();\n\n\t\t\tbar();",
+            "match_indent": True,
+        }))
+        data = _parse(result[0].text)
+        assert data["success"] is True
+        content, _ = converter.read_file_as_utf8(file, data["encoding"])
+        # 各行都用文件实际的 2 tab；空行无缩进
+        lines = content.split("\n")
+        # lines: ['<2tab>foo();', '', '<2tab>bar();', '']
+        assert lines[0] == "\t\tfoo();"
+        assert lines[1] == ""            # 空行无缩进
+        assert lines[2] == "\t\tbar();"  # 多出行继承末行(2 tab)
+
+    def test_crlf_file_lf_old_writes_crlf(self, tmp_path: pytest.TempPathFactory) -> None:
+        # 文件 CRLF + 深 tab；模型用 LF 且 tab 计数偏差 → 命中，写回用 CRLF 与文件实际 tab，
+        # 且被替换行不会因末尾 \r 丢失而降级成 LF。
+        file = tmp_path / "crlf.txt"  # type: ignore[operator]
+        file.write_bytes(
+            "void f() {\r\n"
+            "\t\t\t\tdeepCall();\r\n"
+            "}\r\n"
+            "".encode("gbk")
+        )
+        run(handle_read_file({"path": str(file)}))
+
+        result = run(handle_edit_file({
+            "path": str(file),
+            "old_string": "\t\t\t\t\tdeepCall();",  # LF, 多算 1 tab（避免子串精确命中）
+            "new_string": "\t\t\t\t\tdeepCall(NEW);",  # LF
+            "match_indent": True,
+        }))
+        data = _parse(result[0].text)
+        assert data["success"] is True
+        content, _ = converter.read_file_as_utf8(file, data["encoding"])
+        # 写回：文件实际的 4 tab + CRLF（被替换行保持 CRLF，未降级为 LF）
+        assert "\t\t\t\tdeepCall(NEW);\r\n" in content
+        # 整体仍是 3 个 CRLF、无孤立 LF（证明被替换行未降级）
+        assert content.count("\r\n") == 3
+        assert content.count("\n") == 3
+
+    def test_replace_all_with_indent(self, tmp_path: pytest.TempPathFactory) -> None:
+        # 缩进容错的多义保护优先于 replace_all：两处去前导空白后内容与相对缩进均相同
+        # （仅绝对深度不同），即便 replace_all=true 也应报错，绝不擅自批量替换。
+        text = (
+            "start\n"
+            + ("\t" * 2) + "dup();\n" + ("\t" * 3) + "inner();\n"
+            + "mid\n"
+            + ("\t" * 4) + "dup();\n" + ("\t" * 5) + "inner();\n"
+            + "end\n"
+        )
+        file = tmp_path / "ra.txt"  # type: ignore[operator]
+        file.write_bytes(text.encode("gbk"))
+        run(handle_read_file({"path": str(file)}))
+
+        result = run(handle_edit_file({
+            "path": str(file),
+            "old_string": "\tdup();\n\t\tinner();",
+            "new_string": "\tDUP();\n\t\tINNER();",
+            "replace_all": True,
+            "match_indent": True,
+        }))
+        data = _parse(result[0].text)
+        assert data["success"] is False
+        assert "多处" in data["error"]
+        assert file.read_bytes() == text.encode("gbk")
+
+    def test_indent_match_single_unique_occurrence_with_replace_all(
+        self, tmp_path: pytest.TempPathFactory
+    ) -> None:
+        # 缩进容错唯一命中时 replace_all 无副作用：照常替换一次。
+        t3, t2 = "\t" * 3, "\t" * 2
+        file = tmp_path / "one.txt"  # type: ignore[operator]
+        file.write_bytes((t3 + "onlyHere();\n" + t3 + "next();\n").encode("gbk"))
+        run(handle_read_file({"path": str(file)}))
+
+        result = run(handle_edit_file({
+            "path": str(file),
+            "old_string": t2 + "onlyHere();\n" + t2 + "next();",  # 两行都少算 1 tab
+            "new_string": t2 + "onlyHere(NEW);\n" + t2 + "next();",
+            "replace_all": True,
+            "match_indent": True,
+        }))
+        data = _parse(result[0].text)
+        assert data["success"] is True
+        content, _ = converter.read_file_as_utf8(file, data["encoding"])
+        assert (t3 + "onlyHere(NEW);\n") in content
+        assert "onlyHere();\n" not in content
+
+    def test_off_by_default_no_magic_match(self, tmp_path: pytest.TempPathFactory) -> None:
+        # 不开启 match_indent 时，缩进偏差（且非子串精确命中）应直接报错，
+        # 保持字节精确匹配契约。用 over-count（3 tab vs 文件 2 tab）确保精确匹配失败。
+        file = tmp_path / "d.txt"  # type: ignore[operator]
+        file.write_bytes("\t\tfoo();\n".encode("gbk"))
+        run(handle_read_file({"path": str(file)}))
+
+        result = run(handle_edit_file({
+            "path": str(file),
+            "old_string": "\t\t\tfoo();",  # 多 1 tab，精确匹配失败
+            "new_string": "\t\t\tbar();",
+        }))
+        data = _parse(result[0].text)
+        assert data["success"] is False
+        assert file.read_bytes() == b"\t\tfoo();\n"
+
+
 class TestGetEncoding:
     def test_after_read(self, tmp_path: pytest.TempPathFactory) -> None:
         file = tmp_path / "test.txt"  # type: ignore[operator]

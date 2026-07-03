@@ -57,7 +57,7 @@ claude mcp add fileencoding -- python /path/to/mcp-fileencoding/src/server.py
 | `read_file_with_encoding` | 读取文件，自动检测编码，返回 UTF-8 内容 |
 | `detect_file_encoding` | 只读前 32KB 探测编码与行尾风格（CRLF/LF），不返回文件内容 |
 | `write_file_with_encoding` | 写入文件，自动转回原始编码 |
-| `edit_file_with_encoding` | 局部替换文件内容（字符串替换），支持 `match_line_endings` 行尾容错 |
+| `edit_file_with_encoding` | 局部替换文件内容（字符串替换），支持 `match_line_endings` 行尾容错与 `match_indent` 前导缩进容错 |
 | `get_file_encoding` | 查询文件编码记录；无记录时按需探测并缓存 |
 | `list_all_encodings` | 列出所有已记录的编码 |
 
@@ -112,6 +112,7 @@ claude --system-prompt "在读取和修改 .cpp/.h/.lsp/.txt 等文本文件时�
 - 写入或编辑文件时，如果既无编码记录又未指定 `encoding` 参数，会报错要求显式指定
 - 只需知道编码和换行符、不需要文件内容时，用 `detect_file_encoding` 比 `read_file_with_encoding` 更省 token（不返回内容）
 - `edit_file_with_encoding` 默认逐字节精确匹配 old_string（含换行符）。若 old_string 的换行与文件不一致（例如 AI 用 LF 拼接而文件是 CRLF），可设置 `match_line_endings: true` 让工具按文件主流行尾自动归一化 old_string 和 new_string；混合行尾文件不自动归一化，仍需手动对齐
+- 深层 tab/空格缩进难以精确数对时，可设置 `match_indent: true`：逐字节匹配与行尾容错均失败后，工具按“逐行去掉前导空白后的内容 + 相对缩进层级”整行匹配，容忍缩进计数偏差。命中后写回 new_string 时用文件该区域实际前导空白逐行替换（保留 tab/空格风格与缩进深度，new_string 多出的行继承末行缩进）。多义（去前导空白后仍多处内容相同）会报错，要求更唯一的 old_string；该开关对 CRLF/LF 行尾差异同样有效
 - 检测基于文件内容，短文本可能不够准确，建议文件内容不少于几十个汉字
 
 ## 开发

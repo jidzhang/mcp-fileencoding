@@ -14,7 +14,7 @@ import json
 import asyncio
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 _src_dir = Path(__file__).parent.resolve()
 if str(_src_dir) not in sys.path:
@@ -138,6 +138,16 @@ async def list_tools() -> list[Tool]:
                         "description": "行尾容错(可选,默认 false)。开启后:若 old_string 逐字节匹配失败,"
                                        "会按文件主流行尾(CRLF/LF)归一化 old_string 重试一次,new_string 同步按文件行尾写回。"
                                        "混合行尾或纯 CR 文件不自动归一化。默认关闭以保持字节精确匹配契约。"
+                    },
+                    "match_indent": {
+                        "type": "boolean",
+                        "description": "前导缩进容错(可选,默认 false)。开启后:若逐字节匹配与行尾容错均失败,"
+                                       "会按“逐行去掉前导空白后的内容 + 相对缩进层级”比对整行区段,"
+                                       "容忍深层 tab/空格缩进的计数偏差。命中后写回 new_string 时,"
+                                       "用文件该区域实际前导空白逐行替换,保留 tab/空格风格与缩进深度;"
+                                       "new_string 多出的行继承末行缩进,空行保持为空。"
+                                       "仅整行对齐的匹配参与;多义(去前导空白后仍多处内容相同)会报错,"
+                                       "要求更唯一的 old_string。对 CRLF/LF 行尾差异同样有效。"
                     }
                 },
                 "required": ["path", "old_string", "new_string"]
@@ -324,6 +334,141 @@ def _line_ending_mismatch_hint(content: str, old_string: str) -> str | None:
             "匹配为逐字节精确匹配，请确保 old_string 的换行与文件完全一致（含 \\r）。")
 
 
+# ── 前导缩进容错 ──────────────────────────────────────────────
+# 精确匹配与行尾容错都失败后启用：按“逐行去掉前导空白后的内容 + 相对缩进层级”
+# 比对整行对齐的区段，容忍调用方对深层 tab 缩进的计数偏差。命中后写回 new_string
+# 时，用文件该区域每行的实际前导空白逐行替换 new_string 的前导空白，避免把 tab
+# 改成空格或反之、或改变缩进深度。仅整行对齐的匹配参与；多义（去前导空白后仍多处
+# 内容相同）则报错，要求更唯一的 old_string，绝不擅自替换第一个。
+
+_INDENT_TABSTOP = 8
+
+
+def _split_leading_ws(line: str) -> tuple[str, str]:
+    """拆成 (前导空白, 其余)。前导仅指标记符 tab 与空格。"""
+    rest = line.lstrip(' \t')
+    return line[:len(line) - len(rest)], rest
+
+
+def _visual_width(ws: str) -> int:
+    """把前导空白按制表位 8 展开成列宽：tab 跳到下一个 8 的倍数，空格记 1。"""
+    col = 0
+    for ch in ws:
+        col = (col // _INDENT_TABSTOP + 1) * _INDENT_TABSTOP if ch == '\t' else col + 1
+    return col
+
+
+def _line_parts_for_cmp(line: str) -> tuple[str, str]:
+    """去掉行尾一个 \\r（CRLF 容错），再拆 (前导空白, 内容)。
+    返回的前导空白是文件里该行的实际前导；内容用于逐行比较（保留行内与行尾空白）。"""
+    if line.endswith('\r'):
+        line = line[:-1]
+    return _split_leading_ws(line)
+
+
+def _compute_line_starts(content: str) -> list[int]:
+    """每行（按 \\n 切）在原字符串中的起始偏移，长度等于行数。"""
+    starts = [0]
+    for idx, ch in enumerate(content):
+        if ch == '\n':
+            starts.append(idx + 1)
+    return starts
+
+
+def _region_sep(content_lines: list[str], k: int, n: int, content: str) -> str:
+    """推断被替换区域内部使用的行尾分隔符（CRLF / LF）。
+    主流行尾单一时直接采用；混合 / CR / 无换行时按区域内行尾局部推断。"""
+    le = detect_line_ending(content)
+    if le == 'CRLF':
+        return '\r\n'
+    if le == 'LF':
+        return '\n'
+    sample = content_lines[k:k + n - 1] if n > 1 else content_lines[k:k + 1]
+    return '\r\n' if any(ln.endswith('\r') for ln in sample) else '\n'
+
+
+class _IndentMatch(NamedTuple):
+    """缩进容错匹配结果。candidate_count: 0=未命中, 1=唯一命中, >1=多义。"""
+    matched_old: str | None
+    matched_new: str | None
+    candidate_count: int
+
+
+def _resolve_indent_variant(
+    content: str, old_string: str, new_string: str
+) -> _IndentMatch:
+    """前导缩进容错匹配。
+
+    按 (去掉前导空白后的行内容, 相对首行的缩进列宽) 逐行比对 old_string 与
+    content 的每个整行对齐区段。仅在唯一命中时返回 (matched_old 区域原文,
+    按文件实际缩进改写后的 new_string, 1)；未命中返回 (..., 0)，多义返回
+    (..., 候选数 >1)。matched_old 是 content 中的精确子串，供上层 content.replace
+    使用。行尾容错自然包含：比对按 \\n 切分并剥除行尾 \\r，CRLF / LF 一视同仁。
+    """
+    old_lines = old_string.split('\n')
+    n = len(old_lines)
+    content_lines = content.split('\n')
+    m = len(content_lines)
+    if n == 0 or m < n:
+        return _IndentMatch(None, None, 0)
+
+    old_parts = [_line_parts_for_cmp(ln) for ln in old_lines]
+    old_base = _visual_width(old_parts[0][0])
+    old_sigs = [(rest, _visual_width(lead) - old_base) for lead, rest in old_parts]
+
+    content_parts = [_line_parts_for_cmp(ln) for ln in content_lines]
+    content_widths = [_visual_width(p[0]) for p in content_parts]
+    content_rests = [p[1] for p in content_parts]
+
+    candidates: list[int] = []
+    for k in range(0, m - n + 1):
+        cbase = content_widths[k]
+        hit = True
+        for i in range(n):
+            if content_rests[k + i] != old_sigs[i][0]:
+                hit = False
+                break
+            if content_widths[k + i] - cbase != old_sigs[i][1]:
+                hit = False
+                break
+        if hit:
+            candidates.append(k)
+            if len(candidates) > 1:
+                # 已多义，无需继续扫描；返回 >1 即可触发上层报错
+                return _IndentMatch(None, None, len(candidates))
+
+    if len(candidates) != 1:
+        return _IndentMatch(None, None, len(candidates))
+
+    k = candidates[0]
+    starts = _compute_line_starts(content)
+    start = starts[k]
+    end = starts[k + n] - 1 if (k + n) < m else len(content)
+    # 末行若带 \r（CRLF），把它留在区域外，使其与随后的 \n 配成 CRLF；
+    # 否则 matched_new（sep.join 不产生末尾 \r）替换后会把该行降级成 LF。
+    if end > start and content[end - 1] == '\r':
+        end -= 1
+    matched_old = content[start:end]
+
+    # 用文件实际前导空白逐行改写 new_string：保留 tab / 空格风格与缩进深度。
+    actual_leads = [content_parts[k + i][0] for i in range(n)]
+    sep = _region_sep(content_lines, k, n, content)
+    last_lead_idx = len(actual_leads) - 1
+    rewritten: list[str] = []
+    for j, nline in enumerate(new_string.split('\n')):
+        if nline.endswith('\r'):
+            nline = nline[:-1]
+        body = nline.lstrip(' \t')
+        if body == '':
+            # 空行 / 纯空白行保持为空，避免在空行上引入行尾空白
+            rewritten.append('')
+        else:
+            idx = j if j < last_lead_idx else last_lead_idx
+            rewritten.append(actual_leads[idx] + body)
+    matched_new = sep.join(rewritten)
+    return _IndentMatch(matched_old, matched_new, 1)
+
+
 async def handle_edit_file(arguments: dict[str, Any]) -> list[TextContent]:
     try:
         file_path = Path(_str_arg(arguments, "path")).resolve()
@@ -332,6 +477,7 @@ async def handle_edit_file(arguments: dict[str, Any]) -> list[TextContent]:
         specified_encoding = _optional_str_arg(arguments, "encoding")
         replace_all = _bool_arg(arguments, "replace_all")
         match_line_endings = _bool_arg(arguments, "match_line_endings")
+        match_indent = _bool_arg(arguments, "match_indent")
 
         if not file_path.exists():
             return _error(f"文件不存在: {file_path}")
@@ -343,15 +489,30 @@ async def handle_edit_file(arguments: dict[str, Any]) -> list[TextContent]:
 
         content, read_warnings = read_file_as_utf8(file_path, target_encoding)
 
-        # 逐字节精确匹配优先。失败时若开启 match_line_endings，按文件主流行尾
-        # 归一化 old_string 重试一次（new_string 同步归一化，保证写入行尾与文件一致）。
-        # 混合/无换行/纯 CR 的文件不归一化，交由行尾诊断提示。
+        # 逐字节精确匹配优先。失败时按开启的容错开关依次重试：
+        #   1) match_line_endings：按文件主流行尾归一化 old/new（混合/纯 CR 不归一化）
+        #   2) match_indent：按“逐行去前导空白内容 + 相对缩进层级”整行匹配，
+        #      写回时用文件实际前导空白逐行替换 new_string 的前导空白。
+        # 缩进容错对行尾天然不敏感（按 \n 切分并剥行尾 \r），故即便不同时开启
+        # match_line_endings 也能处理 CRLF/LF 差异。
         matched_old, matched_new = old_string, new_string
         if old_string not in content:
             variant = _resolve_line_ending_variant(content, old_string, new_string) if match_line_endings else None
+            if variant is None and match_indent:
+                im = _resolve_indent_variant(content, old_string, new_string)
+                if im.candidate_count == 1 and im.matched_old is not None and im.matched_new is not None:
+                    variant = (im.matched_old, im.matched_new)
+                elif im.candidate_count > 1:
+                    return _error(
+                        "前导缩进容错匹配到多处可能的整行区段（去前导空白后内容相同）。"
+                        "请提供更唯一的 old_string（增加上下文行），或核对缩进后重试。"
+                    )
             if variant is None:
                 hint = _line_ending_mismatch_hint(content, old_string)
-                return _error(hint or "未找到要替换的文本，请检查 old_string 是否准确")
+                msg = hint or "未找到要替换的文本，请检查 old_string 是否准确"
+                if match_indent:
+                    msg += "（已尝试前导缩进容错，仍未命中唯一整行区段。）"
+                return _error(msg)
             matched_old, matched_new = variant
 
         count = content.count(matched_old)

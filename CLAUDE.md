@@ -11,7 +11,7 @@
 
 这是底线,违反会损坏文件。`tests/test_byte_fidelity.py` 是护栏,任何改动必须保持全绿。
 
-1. **字节保真**:同一文件 read → 用相同 content write,落盘字节逐字节一致;edit 只允许改动被替换的子串,其余字节(含全部 CRLF/LF/CR 行尾)逐字节不变。绝不规范化行尾——不把 `\r\n` 折成 `\n`,也不给 `\n` 补 `\r`,孤立 `\r` 原样保留。
+1. **字节保真**:同一文件 read → 用相同 content write,落盘字节逐字节一致;edit 只允许改动被替换的子串,其余字节(含全部 CRLF/LF/CR 行尾)逐字节不变。**文件原有、未被替换的字节绝不规范化行尾**——不把 `\r\n` 折成 `\n`,也不给 `\n` 补 `\r`,孤立 `\r` 原样保留。但**调用方提供的 new_string / write 的 content(被替换或新写入的部分)**,当文件行尾单一(纯 CRLF 或纯 LF)时,按文件主流行尾归一化换行(纯 CRLF 文件把 LF 转 CRLF、纯 LF 文件把 CRLF 转 LF),避免新内容混入与文件不一致的行尾;混合行尾、孤立 CR、无换行文件不归一化,保持原样。见 `_align_to_file_line_ending`。
 
 2. **不篡改**:目标编码无法表示某字符时,必须抛错拒绝,绝不静默替换成 `?` 或 U+FFFD。见 `src/converter.py` 的 `decode_to_utf8` / `encode_from_utf8`。
 
@@ -46,7 +46,7 @@
 
 | 文件 | 职责 | 关键函数 |
 |------|------|---------|
-| `src/server.py` | MCP 入口、6 个工具定义与 handler、路由 | `_resolve_encoding`(编码解析:参数>缓存>报错)、`_reconcile_utf8_bom`(写前按实际字节保护 UTF-8 BOM)、`_resolve_line_ending_variant`/`_line_ending_mismatch_hint`(行尾容错与诊断)、`_resolve_indent_variant`(前导缩进容错) |
+| `src/server.py` | MCP 入口、6 个工具定义与 handler、路由 | `_resolve_encoding`(编码解析:参数>缓存>报错)、`_reconcile_utf8_bom`(写前按实际字节保护 UTF-8 BOM)、`_align_to_file_line_ending`(写回时按文件主流行尾归一化 new_string/content)、`_resolve_line_ending_variant`/`_line_ending_mismatch_hint`(行尾容错与诊断)、`_resolve_indent_variant`(前导缩进容错) |
 | `src/detector.py` | 编码与行尾探测 | `detect_encoding`、`_detect_by_bom`、`detect_file_encoding_details`(32KB)、`detect_line_ending` |
 | `src/converter.py` | 字节 ↔ UTF-8 转换,手动处理 BOM | `decode_to_utf8`、`encode_from_utf8`、`read_file_as_utf8`、`write_file_from_utf8` |
 | `src/encoding_store.py` | 内存编码缓存 | `store_encoding`、`get_encoding`、`get_all_encodings`、`clear_all` |
@@ -64,6 +64,7 @@ npx pyright src/        # strict 模式,源码必须零错误
 ## 当前实现状态备注
 
 - 按需探测:`detect_file_encoding` 工具 + `get_file_encoding` 缓存未命中时探测(32KB)。
+- 写回行尾归一化:`edit` 写回 new_string、`write` 写回 content 时,按文件主流行尾(纯 CRLF/LF)归一化换行——AI 用 LF 拼多行内容写 CRLF 文件时自动转成 CRLF,不再混入 LF;混合行尾/孤立 CR/无换行文件不归一化。实现 `_align_to_file_line_ending`:edit 在精确与容错命中汇合点统一处理,write 仅对已存在文件按原行尾归一化、新文件原样写。
 - 行尾容错:`edit` 的 `match_line_endings`,精确匹配失败时按文件主流行尾归一化 old/new 重试一次(混合行尾不自动归一化)。
 - 前导缩进容错:`edit` 的 `match_indent`,精确匹配与行尾容错均失败后,按"逐行去掉前导空白后的内容 + 相对首行的缩进列宽(制表位 8)"整行比对,容忍深层 tab/空格缩进的计数偏差。命中后写回 new_string 时,用文件该区域每行的实际前导空白逐行替换 new_string 的前导空白(保留 tab/空格风格与缩进深度);new_string 多出的行继承末行缩进,空行保持为空。多义(去前导空白后仍多处内容相同)一律报错,即便 `replace_all=true` 也不擅自批量替换。仅整行对齐的匹配参与(片段式替换走精确匹配);对 CRLF/LF 行尾差异同样有效。实现见 `_resolve_indent_variant`,测试见 `tests/test_server.py::TestEditMatchIndent` 与 `tests/test_byte_fidelity.py::TestEditMatchIndentByteFidelity`。
 - UTF-8 BOM 保护:edit/write 写已存在的带 BOM 文件时,即使误传 `encoding="utf-8"` 也会纠正为 `utf-8-sig` 保住 BOM 并提示(`_reconcile_utf8_bom`)。

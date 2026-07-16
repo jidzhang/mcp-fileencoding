@@ -205,6 +205,74 @@ class TestWriteFile:
         assert file.read_bytes() == "新建的UTF-8内容。".encode("utf-8")
 
 
+# write 写回归一化：content 换行按原文件主流行尾归一化（纯 CRLF/LF；混合/新文件不动）
+class TestWriteLineEndingNormalization:
+    """write 写回时把 content 换行归一化成原文件主流行尾（纯 CRLF/LF）；
+    混合行尾文件与新文件（无原行尾可参照）不归一化，保持原样。"""
+
+    def test_write_lf_content_to_crlf_file_becomes_crlf(self, tmp_path: pytest.TempPathFactory) -> None:
+        # 调用方用 LF 拼 content，文件是 CRLF → 落盘应归一化成 CRLF
+        file = tmp_path / "crlf.txt"  # type: ignore[operator]
+        file.write_bytes("原始第一行中文内容。\r\n原始第二行中文内容。\r\n".encode("gbk"))
+        run(handle_read_file({"path": str(file)}))
+
+        res = run(handle_write_file({
+            "path": str(file),
+            "content": "新第一行中文内容。\n新第二行中文内容。\n",
+        }))
+        data = _parse(res[0].text)
+        assert data["success"] is True
+        after = file.read_bytes()
+        assert "新第一行中文内容。\r\n".encode("gbk") in after
+        assert "新第一行中文内容。\n".encode("gbk") not in after
+
+    def test_write_crlf_content_to_lf_file_becomes_lf(self, tmp_path: pytest.TempPathFactory) -> None:
+        # 反向：文件 LF，content 含 CRLF → 落盘 LF
+        file = tmp_path / "lf.txt"  # type: ignore[operator]
+        file.write_bytes("原始第一行中文内容。\n原始第二行中文内容。\n".encode("gbk"))
+        run(handle_read_file({"path": str(file)}))
+
+        res = run(handle_write_file({
+            "path": str(file),
+            "content": "新第一行中文内容。\r\n新第二行中文内容。\r\n",
+        }))
+        data = _parse(res[0].text)
+        assert data["success"] is True
+        after = file.read_bytes()
+        assert "新第一行中文内容。\n".encode("gbk") in after
+        assert "新第一行中文内容。\r\n".encode("gbk") not in after
+
+    def test_write_to_mixed_file_not_normalized(self, tmp_path: pytest.TempPathFactory) -> None:
+        # 原文件行尾混合 → 不归一化，content 原样落盘
+        file = tmp_path / "mix.txt"  # type: ignore[operator]
+        file.write_bytes("原始第一行中文。\r\n原始第二行用LF\n".encode("gbk"))
+        run(handle_read_file({"path": str(file)}))
+
+        res = run(handle_write_file({
+            "path": str(file),
+            "content": "新第一行中文内容。\n新第二行中文内容。\n",
+        }))
+        data = _parse(res[0].text)
+        assert data["success"] is True
+        after = file.read_bytes()
+        # 无单一主流行尾，不归一化，content 的 LF 原样落盘
+        assert "新第一行中文内容。\n".encode("gbk") in after
+        assert "新第一行中文内容。\r\n".encode("gbk") not in after
+
+    def test_write_new_file_not_normalized(self, tmp_path: pytest.TempPathFactory) -> None:
+        # 新文件（不存在）无原行尾可参照 → content 原样落盘
+        file = tmp_path / "new.txt"  # type: ignore[operator]
+        res = run(handle_write_file({
+            "path": str(file), "encoding": "gbk",
+            "content": "新第一行中文内容。\n新第二行中文内容。\n",
+        }))
+        data = _parse(res[0].text)
+        assert data["success"] is True
+        after = file.read_bytes()
+        assert "新第一行中文内容。\n".encode("gbk") in after
+        assert "新第一行中文内容。\r\n".encode("gbk") not in after
+
+
 class TestEditFile:
     def test_edit_gbk_file(self, tmp_path: pytest.TempPathFactory) -> None:
         file = tmp_path / "test.txt"  # type: ignore[operator]
@@ -428,7 +496,8 @@ class TestEditMatchLineEndings:
         assert file.read_bytes() == text.encode("gbk")
 
     def test_exact_match_ignores_flag(self, tmp_path: pytest.TempPathFactory) -> None:
-        # old_string 已能精确匹配时，即使开启容错也不做行尾转换
+        # old_string 已能精确匹配时，match_line_endings 开关对匹配无影响；
+        # 但写回时 new_string 的换行仍按文件主流行尾归一化（CRLF 文件→LF 转 CRLF）
         text = "开头旧词结尾，这是一段足够长的中文内容以确保编码检测稳定可靠。\r\n第二行中文继续。\r\n第三行结尾。"
         file = tmp_path / "f.txt"  # type: ignore[operator]
         file.write_bytes(text.encode("gbk"))
@@ -442,9 +511,10 @@ class TestEditMatchLineEndings:
         }))
         data = _parse(result[0].text)
         assert data["success"] is True
-        # 精确匹配命中，new_string 的 LF 原样写入，不被转成 CRLF
+        # 精确匹配命中，new_string 的 LF 按文件主流行尾转成 CRLF
         content, _ = converter.read_file_as_utf8(file, data["encoding"])
-        assert "新词\n第二行" in content
+        assert "新词\r\n第二行" in content
+        assert "新词\n第二行" not in content
 
     def test_replace_all_with_normalization(self, tmp_path: pytest.TempPathFactory) -> None:
         text = "标记内容一用于测试。\r\n标记内容二用于测试。\r\n标记内容三用于测试。\r\n"

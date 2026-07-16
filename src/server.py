@@ -288,6 +288,22 @@ def _to_crlf(s: str) -> str:
     return s.replace('\r\n', '\n').replace('\n', '\r\n')
 
 
+def _align_to_file_line_ending(s: str, content: str) -> str:
+    """把 s 的换行归一化成 content（整份文件）的主流行尾。
+
+    纯 CRLF 文件：把 s 的换行统一成 CRLF；纯 LF 文件：统一成 LF；
+    混合行尾 / 孤立 CR / 无换行：原样返回，不归一化（避免破坏混合行尾文件）。
+    _to_crlf / _to_lf 都先把 CRLF 折成 LF 再统一，故对 s 内已有的混合换行也能
+    正确归一，且对已经全是指定行尾的串幂等——容错路径已归一化的 new 再过一次不变。
+    """
+    le = detect_line_ending(content)
+    if le == 'CRLF':
+        return _to_crlf(s)
+    if le == 'LF':
+        return _to_lf(s)
+    return s
+
+
 def _resolve_line_ending_variant(content: str, old_string: str, new_string: str
                                  ) -> tuple[str, str] | None:
     """
@@ -515,6 +531,10 @@ async def handle_edit_file(arguments: dict[str, Any]) -> list[TextContent]:
                 return _error(msg)
             matched_old, matched_new = variant
 
+        # 写回前：把 new 的换行归一化成文件主流行尾（纯 CRLF/LF；混合 / 孤立 CR / 无换行不动）。
+        # 精确命中与容错命中在此统一处理；容错路径返回的 new 已归一化，再过一次幂等无害。
+        matched_new = _align_to_file_line_ending(matched_new, content)
+
         count = content.count(matched_old)
         if count > 1 and not replace_all:
             return _error(f"要替换的文本出现了 {count} 次。请提供更具体的上下文，或设置 replace_all=true")
@@ -554,6 +574,15 @@ async def handle_write_file(arguments: dict[str, Any]) -> list[TextContent]:
         if err:
             return err
         target_encoding, bom_warning = _reconcile_utf8_bom(file_path, target_encoding)
+
+        # 写回前：若文件已存在，把 content 换行归一化成原文件主流行尾（纯 CRLF/LF），
+        # 避免整文件覆盖时把 CRLF 文件写成 LF；新文件无原行尾可参照，原样写。
+        if file_path.exists():
+            try:
+                old_text, _ = read_file_as_utf8(file_path, target_encoding)
+                content = _align_to_file_line_ending(content, old_text)
+            except Exception:
+                pass  # 旧文件读不动则不归一化，原样写（退化到现状行为）
 
         warnings = bom_warning + write_file_from_utf8(file_path, content, target_encoding)
         store_encoding(str(file_path), target_encoding)

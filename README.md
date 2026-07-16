@@ -111,7 +111,8 @@ claude --system-prompt "在读取和修改 .cpp/.h/.lsp/.txt 等文本文件时�
 - `get_file_encoding` 在无缓存记录时会自动探测（只读前 32KB）并写入缓存；`write`/`edit` 成功后也会写入缓存
 - 写入或编辑文件时，如果既无编码记录又未指定 `encoding` 参数，会报错要求显式指定
 - 只需知道编码和换行符、不需要文件内容时，用 `detect_file_encoding` 比 `read_file_with_encoding` 更省 token（不返回内容）
-- `edit_file_with_encoding` 默认逐字节精确匹配 old_string（含换行符）。若 old_string 的换行与文件不一致（例如 AI 用 LF 拼接而文件是 CRLF），可设置 `match_line_endings: true` 让工具按文件主流行尾自动归一化 old_string 和 new_string；混合行尾文件不自动归一化，仍需手动对齐
+- `edit` 写回 new_string、`write` 写回 content 时，会按文件主流行尾（纯 CRLF/LF）自动归一化换行：AI 用 LF 拼多行内容写 CRLF 文件时自动转成 CRLF，不会把 LF 混入 CRLF 文件；混合行尾、孤立 CR、无换行文件不归一化，保持原样；`write` 对新建文件（无原行尾可参照）也不归一化
+- `edit_file_with_encoding` 默认逐字节精确匹配 old_string（含换行符）。若 old_string 的换行与文件不一致（例如 AI 用 LF 拼接而文件是 CRLF），可设置 `match_line_endings: true` 让工具按文件主流行尾归一化 old_string 以命中（new_string 的写回归一化已默认开启，无需此开关）；混合行尾文件不自动归一化，仍需手动对齐
 - 深层 tab/空格缩进难以精确数对时，可设置 `match_indent: true`：逐字节匹配与行尾容错均失败后，工具按“逐行去掉前导空白后的内容 + 相对缩进层级”整行匹配，容忍缩进计数偏差。命中后写回 new_string 时用文件该区域实际前导空白逐行替换（保留 tab/空格风格与缩进深度，new_string 多出的行继承末行缩进）。多义（去前导空白后仍多处内容相同）会报错，要求更唯一的 old_string；该开关对 CRLF/LF 行尾差异同样有效
 - 检测基于文件内容，短文本可能不够准确，建议文件内容不少于几十个汉字
 

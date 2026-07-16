@@ -171,7 +171,64 @@ class TestEditByteImmutability:
             "old_string": old_sub, "new_string": new_sub,
         }))
         after = file.read_bytes()
-        assert after == self._expect_after_replace(original, old_sub.encode("gbk"), new_sub.encode("gbk"))
+        # 文件是 CRLF，写回时 new_string 的 LF 按主流行尾转成 CRLF
+        expected_new = new_sub.replace("\r\n", "\n").replace("\n", "\r\n")
+        assert after == self._expect_after_replace(original, old_sub.encode("gbk"), expected_new.encode("gbk"))
+
+
+# edit 写回归一化：new_string 的换行按文件主流行尾归一化（纯 CRLF/LF；混合不动）
+class TestEditNewlineNormalization:
+    """edit 写回时把 new_string 的换行归一化成文件主流行尾：纯 CRLF/LF 生效，
+    混合行尾 / 孤立 CR / 无换行不动。精确匹配主路径与容错路径行为一致。"""
+
+    def test_crlf_file_new_lf_normalized_to_crlf(self, tmp_path) -> None:
+        # 精确匹配命中（old_string 单行），文件 CRLF，new 含 LF → 落盘 CRLF
+        text = "开头旧词结尾，足够长的中文内容用于编码检测稳定可靠。\r\n第二行中文继续。\r\n第三行结尾。"
+        file = tmp_path / "f.txt"
+        file.write_bytes(text.encode("gbk"))
+        run(handle_read_file({"path": str(file)}))
+
+        res = run(handle_edit_file({
+            "path": str(file), "old_string": "旧词", "new_string": "新\n词",
+        }))
+        assert _parse(res[0].text)["success"] is True
+        after = file.read_bytes()
+        assert "新\r\n词".encode("gbk") in after
+        assert "新\n词".encode("gbk") not in after
+        # 区外原 CRLF 仍在，未被破坏
+        assert "第二行中文继续。\r\n".encode("gbk") in after
+
+    def test_lf_file_new_crlf_normalized_to_lf(self, tmp_path) -> None:
+        # 反向：文件 LF，new 含 CRLF → 落盘 LF
+        text = "开头旧词结尾，足够长的中文内容用于编码检测稳定可靠。\n第二行中文继续。\n第三行结尾。"
+        file = tmp_path / "f.txt"
+        file.write_bytes(text.encode("gbk"))
+        run(handle_read_file({"path": str(file)}))
+
+        res = run(handle_edit_file({
+            "path": str(file), "old_string": "旧词", "new_string": "新\r\n词",
+        }))
+        assert _parse(res[0].text)["success"] is True
+        after = file.read_bytes()
+        assert "新\n词".encode("gbk") in after
+        assert "新\r\n词".encode("gbk") not in after
+        assert "第二行中文继续。\n".encode("gbk") in after
+
+    def test_mixed_file_new_not_normalized(self, tmp_path) -> None:
+        # 文件行尾混合 → 不归一化，new 原样落盘（守边界，不破坏混合文件）
+        text = "开头旧词结尾，足够长的中文内容用于检测稳定。\r\n第二行用LF结尾\n第三行"
+        file = tmp_path / "f.txt"
+        file.write_bytes(text.encode("gbk"))
+        run(handle_read_file({"path": str(file)}))
+
+        res = run(handle_edit_file({
+            "path": str(file), "old_string": "旧词", "new_string": "新\n词",
+        }))
+        assert _parse(res[0].text)["success"] is True
+        after = file.read_bytes()
+        # 无单一主流行尾，工具不擅自归一化，new 的 LF 原样落盘
+        assert "新\n词".encode("gbk") in after
+        assert "新\r\n词".encode("gbk") not in after
 
 
 # ── match_line_endings：容错替换仍只动被替换区，行尾随文件 ─────────

@@ -24,10 +24,10 @@ def decode_to_utf8(data: bytes, encoding: str) -> tuple[str, list[str]]:
     warnings: list[str] = []
     lower = encoding.lower()
 
-    # 处理带 BOM 的 UTF-8
+    # 处理 UTF-8:utf-8-sig codec 在 C 层剥离前导 BOM、无 BOM 时等同 utf-8 解码,
+    # 与“utf-8 与 utf-8-sig 读侧都剥 BOM”的现状逐字节等价,且省去 data[3:] 的全量切片拷贝。
     if lower in ('utf-8-sig', 'utf-8'):
-        raw = data[3:] if data.startswith(b'\xef\xbb\xbf') else data
-        return raw.decode('utf-8'), warnings
+        return data.decode('utf-8-sig'), warnings
 
     # UTF-16/32：显式字节序编解码，读时去除检测到的 BOM（否则内容会多出前导 U+FEFF）
     if lower in _BOM_BY_ENCODING:

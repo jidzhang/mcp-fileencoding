@@ -38,9 +38,13 @@ def _error(error: str) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps({"success": False, "error": error}, ensure_ascii=False))]
 
 
-def _resolve_encoding(file_path_str: str, specified: str | None = None) -> tuple[str, list[TextContent] | None]:
-    """确定目标编码，返回 (encoding, None) 或 (placeholder, error_response)"""
-    target = specified or get_encoding(file_path_str)
+def _resolve_encoding(file_path_str: str, specified: str | None = None, *,
+                      normalized: bool = False) -> tuple[str, list[TextContent] | None]:
+    """确定目标编码，返回 (encoding, None) 或 (placeholder, error_response)。
+
+    normalized=True:file_path_str 已是 resolve 后的规范化路径,缓存查询省去重复 resolve。
+    """
+    target = specified or get_encoding(file_path_str, normalized=normalized)
     if not target:
         return "", _error(
             "未指定编码，且该文件没有之前的编码记录。"
@@ -207,7 +211,7 @@ def _probe_and_cache_encoding(file_path: Path) -> tuple[EncodingResult, str]:
     供 detect 工具与 get_file_encoding 缓存未命中时共用，保证“探测即缓存”的单一路径。
     """
     result, line_ending = detect_file_encoding_details(file_path)
-    store_encoding(str(file_path), result.encoding, result.confidence)
+    store_encoding(str(file_path), result.encoding, result.confidence, normalized=True)
     return result, line_ending
 
 
@@ -243,29 +247,31 @@ async def handle_read_file(arguments: dict[str, Any]) -> list[TextContent]:
         with open(file_path, 'rb') as f:
             raw_data = f.read()
 
+        key = str(file_path)
+
         if not raw_data:
-            store_encoding(str(file_path), 'utf-8')
+            store_encoding(key, 'utf-8', normalized=True)
             return [TextContent(type="text", text=json.dumps({
-                "success": True, "path": str(file_path),
+                "success": True, "path": key,
                 "encoding": "utf-8", "confidence": 1.0, "content": "",
             }, ensure_ascii=False))]
 
         # 命中未改动缓存(自上次检测以来 mtime/size 未变)则跳过检测,直接复用编码。
         # 大文件检测是大头(2MB GBK ~138ms),避免每次 read 都重算。
-        cached = get_fresh_encoding(str(file_path))
+        cached = get_fresh_encoding(key, normalized=True)
         if cached is not None:
             encoding, confidence = cached
         else:
             detection = detect_encoding(raw_data)
             encoding, confidence = detection.encoding, detection.confidence
+            # 仅缓存未命中(重新检测后)才写缓存:命中时记录未变,重写只是无谓的 stat。
+            store_encoding(key, encoding, confidence, normalized=True)
 
         content, warnings = decode_to_utf8(raw_data, encoding)
 
-        store_encoding(str(file_path), encoding, confidence)
-
         result: dict[str, Any] = {
             "success": True,
-            "path": str(file_path),
+            "path": key,
             "encoding": encoding,
             "confidence": confidence,
             "content": content,
@@ -288,20 +294,47 @@ def _to_crlf(s: str) -> str:
     return s.replace('\r\n', '\n').replace('\n', '\r\n')
 
 
-def _align_to_file_line_ending(s: str, content: str) -> str:
-    """把 s 的换行归一化成 content（整份文件）的主流行尾。
+def _align_to_line_ending(s: str, le: str) -> str:
+    """按已知行尾风格 le（detect_line_ending 的返回值）归一化 s 的换行。
 
-    纯 CRLF 文件：把 s 的换行统一成 CRLF；纯 LF 文件：统一成 LF；
-    混合行尾 / 孤立 CR / 无换行：原样返回，不归一化（避免破坏混合行尾文件）。
-    _to_crlf / _to_lf 都先把 CRLF 折成 LF 再统一，故对 s 内已有的混合换行也能
-    正确归一，且对已经全是指定行尾的串幂等——容错路径已归一化的 new 再过一次不变。
+    纯 CRLF：统一成 CRLF；纯 LF：统一成 LF；混合 / 孤立 CR / 无换行：原样返回。
+    _to_crlf / _to_lf 都先把 CRLF 折成 LF 再统一，故对 s 内已有的混合换行也能正确归一，
+    且对已经全是指定行尾的串幂等——容错路径已归一化的 new 再过一次不变。
     """
-    le = detect_line_ending(content)
     if le == 'CRLF':
         return _to_crlf(s)
     if le == 'LF':
         return _to_lf(s)
     return s
+
+
+def _align_to_file_line_ending(s: str, content: str) -> str:
+    """把 s 的换行归一化成 content（整份文件）的主流行尾。见 _align_to_line_ending。"""
+    return _align_to_line_ending(s, detect_line_ending(content))
+
+
+# 宽字节编码：换行符嵌在多字节码元里（0x0A/0x0D 是码元的一部分），无法在原始字节上
+# 直接数换行，必须先解码再统计。其余字节取向编码（GBK/GB18030/UTF-8/单字节遗留）中
+# 0x0A/0x0D 不可能是多字节字符的尾字节（GBK 尾字节 0x40–0xFE；gb18030 四字节段用
+# 0x30–0x39 / 0x81–0xFE），原始字节上的换行统计与解码后等价，省去整文件解码。
+_WIDE_ENCODING_PREFIXES = ('utf16', 'utf32')
+
+
+def _detect_existing_file_line_ending(file_path: Path, encoding: str) -> str:
+    """统计已存在文件的行尾风格（CRLF/LF/CR/mixed/none）。
+
+    宽字节编码（utf-16*/utf-32*）解码后在 str 上统计；其余编码直接在原始字节上统计，
+    避免为单纯数换行而整文件解码（GBK 大文件的一次全量解码）。
+    """
+    with open(file_path, 'rb') as f:
+        raw = f.read()
+    # 去掉所有分隔符(-/_),使 utf16/utf-16/utf_16/utf-16-le 都折叠成 utf16,
+    # 否则无分隔符别名 utf16/utf32(codecs 合法别名)会漏判,误在原始字节上数换行。
+    norm = encoding.lower().replace('-', '').replace('_', '')
+    if norm.startswith(_WIDE_ENCODING_PREFIXES):
+        text, _ = decode_to_utf8(raw, encoding)
+        return detect_line_ending(text)
+    return detect_line_ending(raw)
 
 
 def _resolve_line_ending_variant(content: str, old_string: str, new_string: str
@@ -498,7 +531,7 @@ async def handle_edit_file(arguments: dict[str, Any]) -> list[TextContent]:
         if not file_path.exists():
             return _error(f"文件不存在: {file_path}")
 
-        target_encoding, err = _resolve_encoding(str(file_path), specified_encoding)
+        target_encoding, err = _resolve_encoding(str(file_path), specified_encoding, normalized=True)
         if err:
             return err
         target_encoding, bom_warning = _reconcile_utf8_bom(file_path, target_encoding)
@@ -533,7 +566,9 @@ async def handle_edit_file(arguments: dict[str, Any]) -> list[TextContent]:
 
         # 写回前：把 new 的换行归一化成文件主流行尾（纯 CRLF/LF；混合 / 孤立 CR / 无换行不动）。
         # 精确命中与容错命中在此统一处理；容错路径返回的 new 已归一化，再过一次幂等无害。
-        matched_new = _align_to_file_line_ending(matched_new, content)
+        # new 不含任何换行时无可归一，跳过 detect_line_ending 的 3 趟全文扫描（单行替换热路径）。
+        if '\n' in matched_new or '\r' in matched_new:
+            matched_new = _align_to_file_line_ending(matched_new, content)
 
         count = content.count(matched_old)
         if count > 1 and not replace_all:
@@ -547,7 +582,7 @@ async def handle_edit_file(arguments: dict[str, Any]) -> list[TextContent]:
             actual_count = 1
 
         write_warnings = write_file_from_utf8(file_path, new_content, target_encoding)
-        store_encoding(str(file_path), target_encoding)
+        store_encoding(str(file_path), target_encoding, normalized=True)
 
         result: dict[str, Any] = {
             "success": True,
@@ -570,22 +605,24 @@ async def handle_write_file(arguments: dict[str, Any]) -> list[TextContent]:
         file_path = Path(_str_arg(arguments, "path")).resolve()
         content = _str_arg(arguments, "content")
 
-        target_encoding, err = _resolve_encoding(str(file_path), _optional_str_arg(arguments, "encoding"))
+        target_encoding, err = _resolve_encoding(str(file_path), _optional_str_arg(arguments, "encoding"),
+                                                  normalized=True)
         if err:
             return err
         target_encoding, bom_warning = _reconcile_utf8_bom(file_path, target_encoding)
 
         # 写回前：若文件已存在，把 content 换行归一化成原文件主流行尾（纯 CRLF/LF），
         # 避免整文件覆盖时把 CRLF 文件写成 LF；新文件无原行尾可参照，原样写。
+        # 行尾统计直接在原始字节上做（宽字节编码才解码），省去整文件解码。
         if file_path.exists():
             try:
-                old_text, _ = read_file_as_utf8(file_path, target_encoding)
-                content = _align_to_file_line_ending(content, old_text)
+                le = _detect_existing_file_line_ending(file_path, target_encoding)
+                content = _align_to_line_ending(content, le)
             except Exception:
                 pass  # 旧文件读不动则不归一化，原样写（退化到现状行为）
 
         warnings = bom_warning + write_file_from_utf8(file_path, content, target_encoding)
-        store_encoding(str(file_path), target_encoding)
+        store_encoding(str(file_path), target_encoding, normalized=True)
 
         content_preview = content[:50] + "..." if len(content) > 50 else content
         content_preview = content_preview.replace('\n', ' ').replace('\r', '')
@@ -613,8 +650,8 @@ async def handle_get_encoding(arguments: dict[str, Any]) -> list[TextContent]:
             return _error(f"文件不存在: {file_path}")
 
         key = str(file_path)
-        if has_encoding(key):
-            encoding = get_encoding(key)
+        if has_encoding(key, normalized=True):
+            encoding = get_encoding(key, normalized=True)
             return [TextContent(type="text", text=json.dumps({
                 "success": True, "path": key, "encoding": encoding
             }, ensure_ascii=False))]

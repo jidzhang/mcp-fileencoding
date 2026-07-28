@@ -273,6 +273,60 @@ class TestWriteLineEndingNormalization:
         assert "新第一行中文内容。\r\n".encode("gbk") not in after
 
 
+class TestWriteWideEncodingLineEnding:
+    """write 对 UTF-16/32 宽字节编码必须先解码再统计行尾。
+
+    若在原始字节上数换行,0x0A/0x0D 是码元的一部分(CRLF 的 0x0D、0x0A 被 0x00 隔开),
+    会被误判成 mixed 而不归一化——本用例断言 LF content 仍被归一化成文件的 CRLF,
+    即可捕获“忘记对宽字节编码分流”的回归。
+    """
+
+    def test_utf16le_crlf_file_normalizes_lf_content_and_keeps_bom(
+        self, tmp_path: pytest.TempPathFactory
+    ) -> None:
+        file = tmp_path / "u16.txt"  # type: ignore[operator]
+        original = "第一行中文内容。\r\n第二行中文内容。\r\n"
+        bom_bytes, _ = converter.encode_from_utf8(original, "utf-16-le")
+        file.write_bytes(bom_bytes)
+        # 首读缓存编码为 utf-16-le
+        read_data = _parse(run(handle_read_file({"path": str(file)}))[0].text)
+        assert read_data["encoding"] == "utf-16-le"
+
+        # 用 LF content 覆盖写;文件主流行尾是 CRLF,应归一化成 CRLF,BOM 保留
+        res = run(handle_write_file({
+            "path": str(file),
+            "content": "新第一行中文。\n新第二行中文。\n",
+        }))
+        assert _parse(res[0].text)["success"] is True
+
+        after = file.read_bytes()
+        assert after.startswith(b"\xff\xfe")  # UTF-16-LE BOM 保留
+        decoded, _ = converter.decode_to_utf8(after, "utf-16-le")
+        assert decoded == "新第一行中文。\r\n新第二行中文。\r\n"
+
+    def test_utf16le_crlf_file_with_undelimited_alias_normalizes_lf(
+        self, tmp_path: pytest.TempPathFactory
+    ) -> None:
+        # 无分隔符别名 utf16(codecs 合法别名)也要正确判定为宽字节编码,
+        # 在原始字节上数换行会得 mixed、content 不被归一化,CRLF 文件被写成 LF。
+        file = tmp_path / "u16alias.txt"  # type: ignore[operator]
+        original = "第一行中文内容。\r\n第二行中文内容。\r\n"
+        bom_bytes, _ = converter.encode_from_utf8(original, "utf-16-le")
+        file.write_bytes(bom_bytes)
+
+        res = run(handle_write_file({
+            "path": str(file),
+            "content": "新第一行中文。\n新第二行中文。\n",
+            "encoding": "utf16",
+        }))
+        assert _parse(res[0].text)["success"] is True
+
+        after = file.read_bytes()
+        assert after.startswith(b"\xff\xfe")  # UTF-16-LE BOM 保留
+        decoded, _ = converter.decode_to_utf8(after, "utf-16-le")
+        assert decoded == "新第一行中文。\r\n新第二行中文。\r\n"
+
+
 class TestEditFile:
     def test_edit_gbk_file(self, tmp_path: pytest.TempPathFactory) -> None:
         file = tmp_path / "test.txt"  # type: ignore[operator]
@@ -954,3 +1008,29 @@ class TestReadCacheFreshness:
         data = _parse(result[0].text)
         assert data["success"] is True
         assert calls, "文件已改动,应重新调用检测"
+
+
+class TestReadCacheHitSkipsStore:
+    """read 缓存命中时不再重写缓存记录:记录未变,重写只是一次无谓的 stat。"""
+
+    def test_cache_hit_does_not_restore(
+        self, tmp_path: pytest.TempPathFactory, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        import server
+        calls: list = []
+        real = server.store_encoding
+
+        def spy(*args, **kwargs):
+            calls.append(args)
+            return real(*args, **kwargs)
+
+        monkeypatch.setattr(server, "store_encoding", spy)
+
+        file = tmp_path / "f.txt"  # type: ignore[operator]
+        file.write_bytes(_GBK_TEXT.encode("gbk"))
+        run(handle_read_file({"path": str(file)}))  # 首读:缓存未命中,写一次缓存
+        assert len(calls) == 1
+
+        result = run(handle_read_file({"path": str(file)}))  # 命中缓存
+        assert _parse(result[0].text)["success"] is True
+        assert len(calls) == 1, "缓存命中时不应再写缓存"

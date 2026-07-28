@@ -26,9 +26,6 @@ _BOM_MAP = [
     (codecs.BOM_UTF16_BE, 'utf-16-be'),   # FE FF
 ]
 
-# 用于快速检测高位字节
-_DEL_ASCII = bytes(range(128))
-
 # charset-normalizer 只喂前 64KB:其判断在几十 KB 后即饱和,喂全量只带来 O(n) 开销
 # (2MB GBK 全量检测 ~138ms,限样本 ~2ms),且 GBK 优先/gb18030 兜底的严格校验仍跑全量。
 _CN_SAMPLE = 65536
@@ -104,8 +101,8 @@ def detect_encoding(data: bytes) -> EncodingResult:
     if bom_encoding:
         return EncodingResult(encoding=bom_encoding, confidence=1.0)
 
-    # 快速检测是否包含高位字节
-    has_high_byte = bool(data.translate(None, _DEL_ASCII))
+    # 快速检测是否包含高位字节(bytes.isascii() 是 C 级扫描,不分配临时拷贝)
+    has_high_byte = not data.isascii()
 
     if not has_high_byte:
         # 纯 ASCII，使用 UTF-8

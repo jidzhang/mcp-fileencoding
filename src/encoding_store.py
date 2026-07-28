@@ -35,6 +35,13 @@ def normalize_path(file_path: str) -> str:
     return str(Path(file_path).resolve())
 
 
+def _key(file_path: str, normalized: bool) -> str:
+    """缓存键。normalized=True 时调用方保证 file_path 已是 resolve 后的规范化路径,
+    直接用作键——省去 Windows 上每次 normalize_path 再 resolve 打开文件句柄的开销
+    (Defender 可能拦截扫描每一次)。默认仍防御性 resolve,对外行为不变。"""
+    return file_path if normalized else normalize_path(file_path)
+
+
 def _snapshot(file_path: str) -> tuple[float, int]:
     """取文件 mtime/size 快照;文件不存在或不可 stat 时返回哨兵。"""
     try:
@@ -44,31 +51,33 @@ def _snapshot(file_path: str) -> tuple[float, int]:
         return _NO_SNAPSHOT
 
 
-def store_encoding(file_path: str, encoding: str, confidence: float = 1.0) -> None:
-    """存储文件的编码信息(并捕获新鲜度快照)"""
-    normalized = normalize_path(file_path)
+def store_encoding(file_path: str, encoding: str, confidence: float = 1.0, *,
+                   normalized: bool = False) -> None:
+    """存储文件的编码信息(并捕获新鲜度快照)。
+
+    normalized=True:调用方保证 file_path 已是 resolve 后的规范化路径,直接用作键。
+    """
+    key = _key(file_path, normalized)
     mtime, size = _snapshot(file_path)
-    _encoding_store[normalized] = _Record(encoding, mtime, size, confidence)
+    _encoding_store[key] = _Record(encoding, mtime, size, confidence)
     # 超出上限时淘汰最早的记录（dict 按插入顺序保留）
     while len(_encoding_store) > _MAX_STORE_SIZE:
         _encoding_store.pop(next(iter(_encoding_store)))
 
 
-def get_encoding(file_path: str) -> Optional[str]:
+def get_encoding(file_path: str, *, normalized: bool = False) -> Optional[str]:
     """获取文件的编码信息"""
-    normalized = normalize_path(file_path)
-    record = _encoding_store.get(normalized)
+    record = _encoding_store.get(_key(file_path, normalized))
     return record.encoding if record is not None else None
 
 
-def get_fresh_encoding(file_path: str) -> Optional[tuple[str, float]]:
+def get_fresh_encoding(file_path: str, *, normalized: bool = False) -> Optional[tuple[str, float]]:
     """若该文件有缓存记录且自记录以来未改动,返回 (编码, 置信度);否则返回 None。
 
     用于 read 跳过重复检测:以 mtime+size 判定文件是否变化。无快照(哨兵)、
     文件已不存在或已改动时返回 None,调用方应重新检测。
     """
-    normalized = normalize_path(file_path)
-    record = _encoding_store.get(normalized)
+    record = _encoding_store.get(_key(file_path, normalized))
     if record is None or record.size == -1:
         return None
     mtime, size = _snapshot(file_path)
@@ -79,10 +88,9 @@ def get_fresh_encoding(file_path: str) -> Optional[tuple[str, float]]:
     return None
 
 
-def has_encoding(file_path: str) -> bool:
+def has_encoding(file_path: str, *, normalized: bool = False) -> bool:
     """检查是否有文件的编码记录"""
-    normalized = normalize_path(file_path)
-    return normalized in _encoding_store
+    return _key(file_path, normalized) in _encoding_store
 
 
 def clear_encoding(file_path: str) -> None:

@@ -1034,3 +1034,254 @@ class TestReadCacheHitSkipsStore:
         result = run(handle_read_file({"path": str(file)}))  # 命中缓存
         assert _parse(result[0].text)["success"] is True
         assert len(calls) == 1, "缓存命中时不应再写缓存"
+
+
+class TestReadSelfHeal:
+    """read 解码失败自愈:缓存/detect 的 32KB 前缀结论解不开时,按全文重检后
+    重试一次,而不是把裸 codec 异常抛给调用方;仍失败才报明确错误。"""
+
+    def test_read_heals_prefix_poisoned_cache(self, tmp_path: pytest.TempPathFactory) -> None:
+        # 33KB:前 32KB 全 ASCII,尾部 GBK。detect 判 utf-1 入缓存(只看前缀),
+        # read 解码失败后应自愈为 GB 系并返回正确内容
+        prefix = b"ascii line\r\n" * 3000
+        tail = "尾部中文内容用于制造差异,足够长以便检测稳定。".encode("gbk")
+        file = tmp_path / "big.txt"  # type: ignore[operator]
+        file.write_bytes(prefix + tail)
+        detect_data = _parse(run(handle_detect_file_encoding({"path": str(file)}))[0].text)
+        assert detect_data["encoding"] == "utf-8"
+
+        result = run(handle_read_file({"path": str(file)}))
+        data = _parse(result[0].text)
+        assert data["success"] is True
+        assert data["encoding"] in ("gbk", "gb18030")
+        assert "尾部中文内容" in data["content"]
+        assert any("重新检测" in w for w in data.get("warnings", []))
+
+        # 缓存已被纠正:再次 read 直接命中,无需自愈
+        data2 = _parse(run(handle_read_file({"path": str(file)}))[0].text)
+        assert data2["success"] is True
+        assert data2["encoding"] in ("gbk", "gb18030")
+        assert "重新检测" not in "".join(data2.get("warnings", []))
+
+    def test_read_bom_plus_gbk_body(self, tmp_path: pytest.TempPathFactory) -> None:
+        # UTF-8 BOM + GBK 正文拼接体(非合法 UTF-8):首次 read 即自愈,
+        # 剥 BOM 按 GB 系读取,并明确告知写回时 BOM 会被移除
+        body = "这是正文中文内容,用于测试BOM拼接体处理逻辑,足够长。"
+        file = tmp_path / "bom_gbk.txt"  # type: ignore[operator]
+        file.write_bytes(b"\xef\xbb\xbf" + body.encode("gbk"))
+
+        result = run(handle_read_file({"path": str(file)}))
+        data = _parse(result[0].text)
+        assert data["success"] is True
+        assert data["content"] == body
+        assert data["encoding"] in ("gbk", "gb18030")
+        assert any("BOM" in w for w in data.get("warnings", []))
+
+    def test_read_undecodable_reports_clear_error(self, tmp_path: pytest.TempPathFactory) -> None:
+        # 任何严格编码都解不开的字节(0xFF 对 utf-8/gbk/gb18030/big5 均非法,
+        # charset-normalizer 也放弃):应报明确的错误信息,而不是裸 codec 异常
+        file = tmp_path / "bin.dat"  # type: ignore[operator]
+        file.write_bytes(b"\xff" * 64 + b"\x81" * 64)
+
+        result = run(handle_read_file({"path": str(file)}))
+        data = _parse(result[0].text)
+        assert data["success"] is False
+        assert "无法解码" in data["error"]
+
+
+class TestEditWriteFreshness:
+    """缓存新鲜度(#2):文件被外部工具换编码后,edit/write/get_file_encoding
+    重新探测,不拿过期编码解码/编码新字节,避免混合编码损坏。"""
+
+    def _rewrite_as(self, file, text: str, encoding: str) -> None:
+        # 模拟外部另存为:换内容并推进 mtime,确保新鲜度判定失效
+        import os
+        import time
+        file.write_bytes(text.encode(encoding))
+        future = time.time() + 100
+        os.utime(file, (future, future))
+
+    def test_edit_after_external_reencode_to_utf8(self, tmp_path: pytest.TempPathFactory) -> None:
+        file = tmp_path / "f.txt"  # type: ignore[operator]
+        file.write_bytes(("int f() { return 0; } // 旧中文注释内容".encode("gbk")))
+        run(handle_read_file({"path": str(file)}))  # 缓存 GB 系
+
+        self._rewrite_as(file, "int f() { return 0; } // 外部改成UTF-8的内容", "utf-8")
+
+        result = run(handle_edit_file({
+            "path": str(file),
+            "old_string": "return 0; } // ",
+            "new_string": "return 1; } // ",
+        }))
+        data = _parse(result[0].text)
+        assert data["success"] is True
+        assert data["encoding"] == "utf-8"
+        # 文件仍是合法 UTF-8,无 GBK 字节混入
+        assert file.read_bytes() == "int f() { return 1; } // 外部改成UTF-8的内容".encode("utf-8")
+
+    def test_write_after_external_reencode_follows_new_encoding(
+        self, tmp_path: pytest.TempPathFactory
+    ) -> None:
+        file = tmp_path / "f.txt"  # type: ignore[operator]
+        file.write_bytes("旧的中文内容第一行\r\n旧的中文内容第二行\r\n".encode("gbk"))
+        run(handle_read_file({"path": str(file)}))
+
+        self._rewrite_as(file, "新的外部内容第一行\r\n新的外部内容第二行\r\n", "utf-8")
+
+        res = run(handle_write_file({
+            "path": str(file),
+            "content": "写入的新中文内容第一行\r\n写入的新中文内容第二行\r\n",
+        }))
+        data = _parse(res[0].text)
+        assert data["success"] is True
+        assert data["encoding"] == "utf-8"
+        assert file.read_bytes() == "写入的新中文内容第一行\r\n写入的新中文内容第二行\r\n".encode("utf-8")
+
+    def test_get_encoding_reprobes_after_external_change(self, tmp_path: pytest.TempPathFactory) -> None:
+        file = tmp_path / "f.txt"  # type: ignore[operator]
+        file.write_bytes(_GBK_TEXT.encode("gbk"))
+        run(handle_read_file({"path": str(file)}))
+
+        self._rewrite_as(file, "外部改成UTF-8的中文内容,足够长以供检测稳定可靠。", "utf-8")
+
+        result = run(handle_get_encoding({"path": str(file)}))
+        data = _parse(result[0].text)
+        assert data["success"] is True
+        assert data["encoding"] == "utf-8"
+
+    def test_edit_unchanged_file_skips_reprobe(self, tmp_path: pytest.TempPathFactory,
+                                               monkeypatch: pytest.MonkeyPatch) -> None:
+        # 文件未改动:edit 直接复用新鲜缓存,不重新探测(每次调用保持低开销)
+        file = tmp_path / "f.txt"  # type: ignore[operator]
+        file.write_bytes("中文内容足够长以供编码检测稳定可靠。".encode("gbk"))
+        run(handle_read_file({"path": str(file)}))
+
+        import detector
+        import server
+        calls: list = []
+        real = detector.detect_file_encoding_details
+
+        def spy(p):
+            calls.append(p)
+            return real(p)
+
+        monkeypatch.setattr(detector, "detect_file_encoding_details", spy)
+        monkeypatch.setattr(server, "detect_file_encoding_details", spy)
+
+        result = run(handle_edit_file({
+            "path": str(file), "old_string": "中文", "new_string": "汉字",
+        }))
+        assert _parse(result[0].text)["success"] is True
+        assert calls == [], "文件未改动,不应重新探测"
+
+    def test_edit_with_stale_explicit_encoding_heals(self, tmp_path: pytest.TempPathFactory) -> None:
+        # 显式 encoding 优先于缓存且不做新鲜度校验;若它解不开当前字节
+        # (调用方拿着过期的编码知识),edit 应自愈重检而不是直接失败。
+        # 构造:GBK 文件被外部改成 UTF-8(无 BOM、奇数个汉字→奇数个高位字节,
+        # GBK 严格解码必失败),调用方仍显式传 encoding="gbk"。
+        file = tmp_path / "f.txt"  # type: ignore[operator]
+        file.write_bytes("旧中文内容足够长。".encode("gbk"))
+        run(handle_read_file({"path": str(file)}))  # 缓存 GB 系
+
+        new_text = "新中文内容足够长供检测"  # 11 个汉字 = 33 个高位字节(奇数)
+        assert len(new_text.encode("utf-8")) % 2 == 1
+        file.write_bytes(new_text.encode("utf-8"))
+
+        result = run(handle_edit_file({
+            "path": str(file), "encoding": "gbk",
+            "old_string": "新中文内容", "new_string": "改后中文内容",
+        }))
+        data = _parse(result[0].text)
+        assert data["success"] is True
+        assert data["encoding"] == "utf-8"
+        assert file.read_bytes() == "改后中文内容足够长供检测".encode("utf-8")
+
+
+class TestEncodingAliasNormalization:
+    """显式编码名归一化(#5):utf8/utf_8_sig/大写等合法别名归一为规范名,
+    不再绕过 UTF-8 BOM 保护与 converter 的 BOM 剥补表。"""
+
+    def test_alias_utf8_write_preserves_bom(self, tmp_path: pytest.TempPathFactory) -> None:
+        # 回归复现:传 encoding="utf8" 曾静默丢 BOM 且无警告
+        file = tmp_path / "bom.txt"  # type: ignore[operator]
+        file.write_bytes(b"\xef\xbb\xbf" + "带BOM的原始UTF-8中文内容,足够长。".encode("utf-8"))
+
+        result = run(handle_write_file({
+            "path": str(file), "encoding": "utf8",
+            "content": "别名写入的新UTF-8中文内容,足够长。",
+        }))
+        data = _parse(result[0].text)
+        assert data["success"] is True
+        assert file.read_bytes().startswith(b"\xef\xbb\xbf")
+        assert data["encoding"] == "utf-8-sig"
+        assert any("utf-8-sig" in w for w in data.get("warnings", []))
+
+    def test_alias_utf8_edit_preserves_bom(self, tmp_path: pytest.TempPathFactory) -> None:
+        file = tmp_path / "bom.txt"  # type: ignore[operator]
+        file.write_bytes(b"\xef\xbb\xbf" + "带BOM的原始内容,测试别名编辑,足够长。".encode("utf-8"))
+
+        result = run(handle_edit_file({
+            "path": str(file), "encoding": "utf8",
+            "old_string": "测试", "new_string": "验证",
+        }))
+        data = _parse(result[0].text)
+        assert data["success"] is True
+        assert file.read_bytes().startswith(b"\xef\xbb\xbf")
+        assert data["encoding"] == "utf-8-sig"
+        assert any("utf-8-sig" in w for w in data.get("warnings", []))
+
+    def test_uppercase_utf8_alias_preserves_bom(self, tmp_path: pytest.TempPathFactory) -> None:
+        file = tmp_path / "bom.txt"  # type: ignore[operator]
+        file.write_bytes(b"\xef\xbb\xbf" + "带BOM的原始内容,大写别名测试,足够长。".encode("utf-8"))
+
+        result = run(handle_write_file({
+            "path": str(file), "encoding": "UTF-8",
+            "content": "大写别名写入的新内容,足够长。",
+        }))
+        data = _parse(result[0].text)
+        assert data["success"] is True
+        assert file.read_bytes().startswith(b"\xef\xbb\xbf")
+
+    def test_alias_utf_16_le_roundtrip(self, tmp_path: pytest.TempPathFactory) -> None:
+        # 下划线别名 utf_16_le 归一为 utf-16-le,写回补对应 BOM
+        import codecs as _codecs
+        file = tmp_path / "u16.txt"  # type: ignore[operator]
+        result = run(handle_write_file({
+            "path": str(file), "encoding": "utf_16_le", "content": "中文内容测试别名归一",
+        }))
+        assert _parse(result[0].text)["success"] is True
+        assert file.read_bytes().startswith(_codecs.BOM_UTF16_LE)
+        back = run(handle_read_file({"path": str(file)}))
+        back_data = _parse(back[0].text)
+        assert back_data["success"] is True
+        assert back_data["content"] == "中文内容测试别名归一"
+
+    def test_unknown_alias_rejected(self, tmp_path: pytest.TempPathFactory) -> None:
+        result = run(handle_write_file({
+            "path": str(tmp_path / "f.txt"), "content": "x", "encoding": "not-a-codec",
+        }))
+        data = _parse(result[0].text)
+        assert data["success"] is False
+        assert "不支持的编码" in data["error"]
+
+    def test_alias_cp936_normalized_to_gbk(self, tmp_path: pytest.TempPathFactory) -> None:
+        # cp936 是 gbk 的别名,归一后缓存与响应里都是规范名
+        file = tmp_path / "f.txt"  # type: ignore[operator]
+        result = run(handle_write_file({
+            "path": str(file), "encoding": "cp936", "content": "中文内容测试规范名",
+        }))
+        data = _parse(result[0].text)
+        assert data["success"] is True
+        assert data["encoding"] == "gbk"
+        assert file.read_bytes() == "中文内容测试规范名".encode("gbk")
+
+    def test_alias_gb2312_normalized_to_gbk(self, tmp_path: pytest.TempPathFactory) -> None:
+        # gb2312 是 gbk 的子集,显式传参与检测侧同口径归一为 gbk
+        file = tmp_path / "f.txt"  # type: ignore[operator]
+        result = run(handle_write_file({
+            "path": str(file), "encoding": "gb2312", "content": "中文内容测试规范名",
+        }))
+        data = _parse(result[0].text)
+        assert data["success"] is True
+        assert data["encoding"] == "gbk"
+        assert file.read_bytes() == "中文内容测试规范名".encode("gbk")

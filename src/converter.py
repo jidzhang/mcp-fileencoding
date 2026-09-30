@@ -86,10 +86,27 @@ def write_file_from_utf8(file_path: str | Path, content: str, encoding: str) -> 
     return warnings
 
 
-def is_encoding_supported(encoding: str) -> bool:
-    """检查编码是否被 Python 支持"""
+def canonical_encoding(encoding: str) -> str | None:
+    """把编码名归一化为项目规范名:codecs.lookup 的 name(连字符风格),另按项目
+    口径把子集归一到超集。utf8/UTF-8→utf-8、utf_8_sig→utf-8-sig、cp936→gbk、
+    gb2312→gbk、ascii→utf-8。
+
+    归一化后,各编码别名不再绕过基于编码名字面量的判断(如 utf-8 BOM 保护、
+    converter 的 BOM 剥补表),显式传参与检测两侧的口径也一致。不支持的编码名
+    返回 None。
+    """
     try:
-        ''.encode(encoding)
-        return True
-    except LookupError:
-        return False
+        name = codecs.lookup(encoding).name
+    except (LookupError, TypeError):
+        return None
+    # gb2312 是 gbk 的子集,统一使用 gbk(与检测侧同一决策);ascii 视为 utf-8
+    if name == 'gb2312':
+        return 'gbk'
+    if name == 'ascii':
+        return 'utf-8'
+    return name
+
+
+def is_encoding_supported(encoding: str) -> bool:
+    """检查编码是否被 Python 支持(与 canonical_encoding 同一判定)"""
+    return canonical_encoding(encoding) is not None

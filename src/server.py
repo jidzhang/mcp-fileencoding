@@ -24,10 +24,15 @@ from mcp.server import Server
 from mcp.server.stdio import stdio_server
 from mcp.types import Tool, TextContent
 
-from detector import detect_encoding, detect_file_encoding_details, detect_line_ending, EncodingResult
-from converter import decode_to_utf8, read_file_as_utf8, write_file_from_utf8, is_encoding_supported
+from detector import (
+    detect_encoding, detect_file_encoding_details, detect_line_ending,
+    detect_with_safety_net, decode_bom_gb_body, EncodingResult,
+)
+from converter import (
+    decode_to_utf8, write_file_from_utf8, canonical_encoding,
+)
 from encoding_store import (
-    store_encoding, get_encoding, has_encoding, get_all_encodings, get_fresh_encoding,
+    store_encoding, has_encoding, get_all_encodings, get_fresh_encoding,
 )
 
 server = Server("encoding-server")
@@ -38,20 +43,40 @@ def _error(error: str) -> list[TextContent]:
     return [TextContent(type="text", text=json.dumps({"success": False, "error": error}, ensure_ascii=False))]
 
 
+def _reprobe_and_cache(file_path_str: str, *, normalized: bool = False) -> EncodingResult:
+    """过期重探:文件已改动时重新探测并更新缓存(探测即缓存的单一路径)。"""
+    path = file_path_str if normalized else str(Path(file_path_str).resolve())
+    return _probe_and_cache_encoding(path)[0]
+
+
 def _resolve_encoding(file_path_str: str, specified: str | None = None, *,
                       normalized: bool = False) -> tuple[str, list[TextContent] | None]:
     """确定目标编码，返回 (encoding, None) 或 (placeholder, error_response)。
 
+    显式 encoding:先归一化为规范名(utf8/UTF-8→utf-8、utf_8_sig→utf-8-sig、cp936→gbk),
+    别名不再绕过 BOM 保护等字面量判断。未显式指定时:缓存新鲜(自上次记录以来
+    mtime/size 未变)直接复用;有记录但文件已改动则重新探测,避免拿过期编码解码
+    被外部工具换过编码的文件。无记录报错,要求先 read 或显式指定。
     normalized=True:file_path_str 已是 resolve 后的规范化路径,缓存查询省去重复 resolve。
     """
-    target = specified or get_encoding(file_path_str, normalized=normalized)
+    if specified is not None:
+        target = canonical_encoding(specified)
+        if target is None:
+            return "", _error(f"不支持的编码: {specified}")
+    else:
+        fresh = get_fresh_encoding(file_path_str, normalized=normalized)
+        if fresh is not None:
+            target = fresh[0]
+        elif has_encoding(file_path_str, normalized=normalized):
+            # 有记录但文件已改动:重新探测并更新缓存(探测即缓存的单一路径)
+            target = _reprobe_and_cache(file_path_str, normalized=normalized).encoding
+        else:
+            target = None
     if not target:
         return "", _error(
             "未指定编码，且该文件没有之前的编码记录。"
             "请先使用 read_file_with_encoding 读取文件，或手动指定 encoding 参数。"
         )
-    if not is_encoding_supported(target):
-        return "", _error(f"不支持的编码: {target}")
     return target, None
 
 
@@ -83,6 +108,41 @@ def _reconcile_utf8_bom(file_path: Path, target_encoding: str) -> tuple[str, lis
         )
         return 'utf-8-sig', warnings
     return target_encoding, warnings
+
+
+def _decode_with_redetect(raw: bytes, encoding: str, confidence: float
+                          ) -> tuple[str, str, float, list[str]] | None:
+    """按 encoding 解码;解不开时丢弃旧结论,按全文重新检测后重试一次。
+
+    供 read/edit 使用,三类场景在这里自愈而不是把裸解码异常抛给调用方:
+    缓存编码过期(外部工具换过文件编码)、detect 的 32KB 前缀误判、
+    UTF-8 BOM + GB 系正文的拼接体。返回 (内容, 编码, 置信度, 警告);
+    两种尝试都失败返回 None(调用方给出明确报错)。
+    """
+    try:
+        content, warnings = decode_to_utf8(raw, encoding)
+        return content, encoding, confidence, warnings
+    except (UnicodeError, LookupError, ValueError):
+        pass
+
+    notes = [f"按 {encoding} 解码失败,已按全文重新检测。"]
+    # UTF-8 BOM + GB 系正文的拼接体:剥 BOM 按 GB 系读取(单一实现在 detector)
+    recovered = decode_bom_gb_body(raw)
+    if recovered is not None:
+        content, enc = recovered
+        notes.append(
+            f"文件为 UTF-8 BOM 与 GB 系正文的拼接(非合法 UTF-8),已剥离 BOM "
+            f"按 {enc} 读取;写回将以 {enc} 落盘,BOM 会被移除。"
+        )
+        return content, enc, 0.9, notes
+    # 其余:按全文重新检测(含安全网)后重试
+    r = detect_with_safety_net(raw)
+    try:
+        content, warnings = decode_to_utf8(raw, r.encoding)
+    except (UnicodeError, LookupError, ValueError):
+        return None
+    notes.append(f"重新检测为 {r.encoding}。")
+    return content, r.encoding, r.confidence, notes + warnings
 
 
 # ── 工具定义 ──────────────────────────────────────────────
@@ -205,14 +265,23 @@ def _bool_arg(arguments: dict[str, Any], key: str, default: bool = False) -> boo
     return val
 
 
-def _probe_and_cache_encoding(file_path: Path) -> tuple[EncodingResult, str]:
+def _probe_and_cache_encoding(file_path: str | Path) -> tuple[EncodingResult, str]:
     """探测文件编码与行尾风格（只读前 32KB）并写入缓存，返回 (结果, 行尾风格)。
 
-    供 detect 工具与 get_file_encoding 缓存未命中时共用，保证“探测即缓存”的单一路径。
+    供 detect 工具、get_file_encoding 与编码解析的过期重探共用，保证“探测即缓存”
+    的单一路径。file_path 须已是规范化路径(缓存以它为键)。
     """
     result, line_ending = detect_file_encoding_details(file_path)
     store_encoding(str(file_path), result.encoding, result.confidence, normalized=True)
     return result, line_ending
+
+
+def _current_encoding(file_path_str: str, *, normalized: bool = False) -> EncodingResult:
+    """当前编码:新鲜缓存(mtime/size 未变)命中直接复用;否则重新探测并更新缓存。"""
+    fresh = get_fresh_encoding(file_path_str, normalized=normalized)
+    if fresh is not None:
+        return EncodingResult(fresh[0], fresh[1])
+    return _reprobe_and_cache(file_path_str, normalized=normalized)
 
 
 async def handle_detect_file_encoding(arguments: dict[str, Any]) -> list[TextContent]:
@@ -264,10 +333,21 @@ async def handle_read_file(arguments: dict[str, Any]) -> list[TextContent]:
         else:
             detection = detect_encoding(raw_data)
             encoding, confidence = detection.encoding, detection.confidence
-            # 仅缓存未命中(重新检测后)才写缓存:命中时记录未变,重写只是无谓的 stat。
-            store_encoding(key, encoding, confidence, normalized=True)
 
-        content, warnings = decode_to_utf8(raw_data, encoding)
+        # 解码失败自愈:缓存过期(前缀误判/外部换过编码)时按全文重检后重试一次,
+        # 而不是把裸解码异常抛给调用方。见 _decode_with_redetect。
+        decoded = _decode_with_redetect(raw_data, encoding, confidence)
+        if decoded is None:
+            return _error(
+                f"无法解码文件:已尝试 {encoding} 并按全文重新检测,均失败。"
+                "文件可能是二进制文件或已损坏。"
+            )
+        content, encoding, confidence, warnings = decoded
+
+        # 仅在必要时写缓存:首次检测(未命中),或自愈纠正了旧结论。
+        # 命中且解码顺利时记录未变,重写只是一次无谓的 stat。
+        if cached is None or cached[0] != encoding:
+            store_encoding(key, encoding, confidence, normalized=True)
 
         result: dict[str, Any] = {
             "success": True,
@@ -347,12 +427,10 @@ def _resolve_line_ending_variant(content: str, old_string: str, new_string: str
     否则返回 None（混合/无换行/纯 CR 文件、或归一化后仍不匹配、或无需转换）。
     """
     le = detect_line_ending(content)
-    if le == 'CRLF':
-        norm_old, norm_new = _to_crlf(old_string), _to_crlf(new_string)
-    elif le == 'LF':
-        norm_old, norm_new = _to_lf(old_string), _to_lf(new_string)
-    else:
+    if le not in ('CRLF', 'LF'):
         return None
+    norm_old = _align_to_line_ending(old_string, le)
+    norm_new = _align_to_line_ending(new_string, le)
     if norm_old != old_string and norm_old in content:
         return norm_old, norm_new
     return None
@@ -534,9 +612,20 @@ async def handle_edit_file(arguments: dict[str, Any]) -> list[TextContent]:
         target_encoding, err = _resolve_encoding(str(file_path), specified_encoding, normalized=True)
         if err:
             return err
-        target_encoding, bom_warning = _reconcile_utf8_bom(file_path, target_encoding)
 
-        content, read_warnings = read_file_as_utf8(file_path, target_encoding)
+        # 读取 + 解码失败自愈(与 read 同一机制):缓存编码解不开当前字节时按全文重检
+        with open(file_path, 'rb') as f:
+            raw = f.read()
+        decoded = _decode_with_redetect(raw, target_encoding, 1.0)
+        if decoded is None:
+            return _error(
+                f"无法解码文件:已尝试 {target_encoding} 并按全文重新检测,均失败。"
+                "请确认文件编码,或先用 read_file_with_encoding 查看错误详情。"
+            )
+        content, target_encoding, _, read_warnings = decoded
+        # BOM 核对放在编码定型后做一次:解码对 utf-8/utf-8-sig 同路径,放早了会在
+        # 编码被自愈纠正后作废,白做一次
+        target_encoding, bom_warning = _reconcile_utf8_bom(file_path, target_encoding)
 
         # 逐字节精确匹配优先。失败时按开启的容错开关依次重试：
         #   1) match_line_endings：按文件主流行尾归一化 old/new（混合/纯 CR 不归一化）
@@ -650,14 +739,9 @@ async def handle_get_encoding(arguments: dict[str, Any]) -> list[TextContent]:
             return _error(f"文件不存在: {file_path}")
 
         key = str(file_path)
-        if has_encoding(key, normalized=True):
-            encoding = get_encoding(key, normalized=True)
-            return [TextContent(type="text", text=json.dumps({
-                "success": True, "path": key, "encoding": encoding
-            }, ensure_ascii=False))]
-
-        # 无缓存记录但文件存在：按需探测（只读前 32KB），结果写入缓存供后续复用
-        result, _ = _probe_and_cache_encoding(file_path)
+        # 无记录,或文件自上次记录后已改动:按需重新探测(只读前 32KB)并更新缓存,
+        # 避免把外部换过编码后的旧结论当事实返回
+        result = _current_encoding(key, normalized=True)
         return [TextContent(type="text", text=json.dumps({
             "success": True, "path": key, "encoding": result.encoding
         }, ensure_ascii=False))]

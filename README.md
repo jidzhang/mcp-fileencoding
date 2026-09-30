@@ -108,7 +108,9 @@ claude --system-prompt "在读取和修改 .cpp/.h/.lsp/.txt 等文本文件时�
 ### 注意事项
 
 - 编码记录存储在内存中，MCP 服务器重启后清空
-- `get_file_encoding` 在无缓存记录时会自动探测（只读前 32KB）并写入缓存；`write`/`edit` 成功后也会写入缓存
+- 编码记录带新鲜度校验（mtime/size）：`get_file_encoding` 无记录或文件已改动时重新探测；`write`/`edit` 未显式指定 `encoding` 时，若文件已被外部工具改过（如另存为其他编码），会先重新探测再读写，不拿旧编码处理新内容
+- `read`/`edit` 遇到编码判定与文件实际字节不符（如大文件前 32KB 全 ASCII 导致探测偏差、外部工具换过编码、UTF-8 BOM 拼接 GBK 正文的异常文件）时，自动按全文重新检测后重试一次并给出提示，而不是直接抛解码错误
+- `encoding` 参数接受编码别名（`utf8`/`UTF-8`/`utf_8_sig`/`cp936` 等），会自动归一化为规范名；带 BOM 的文件即使传 `utf-8` 别名也会保住 BOM
 - 写入或编辑文件时，如果既无编码记录又未指定 `encoding` 参数，会报错要求显式指定
 - 只需知道编码和换行符、不需要文件内容时，用 `detect_file_encoding` 比 `read_file_with_encoding` 更省 token（不返回内容）
 - `edit` 写回 new_string、`write` 写回 content 时，会按文件主流行尾（纯 CRLF/LF）自动归一化换行：AI 用 LF 拼多行内容写 CRLF 文件时自动转成 CRLF，不会把 LF 混入 CRLF 文件；混合行尾、孤立 CR、无换行文件不归一化，保持原样；`write` 对新建文件（无原行尾可参照）也不归一化
